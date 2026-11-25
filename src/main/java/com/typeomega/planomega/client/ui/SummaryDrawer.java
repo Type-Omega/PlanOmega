@@ -89,7 +89,30 @@ public final class SummaryDrawer {
         gfx.drawString(font, String.format("Machines: %d  |  Net: %s EU/t",
                         result.totalMachinesCeil(), RATE_FMT.format(result.netEut())),
                 padX, cy, Theme.TEXT_SECONDARY, false);
-        cy += 14;
+        cy += 13;
+
+        // Per-tier Amperage & Energy Hatch breakdown
+        if (!result.tierAmperage().isEmpty() && cy + 22 < y + height) {
+            gfx.drawString(font, Component.translatable("planomega.summary.amperage"), padX, cy, Theme.TEXT_PRIMARY, false);
+            cy += 11;
+            int tiersShown = 0;
+            for (Map.Entry<VoltageTier, Double> entry : result.tierAmperage().entrySet()) {
+                if (cy + 12 > y + height - 6 || tiersShown >= 4) {
+                    break;
+                }
+                double amps = entry.getValue();
+                int ampColor = amps > 16.0 + 1e-6 ? 0xFFEF4444
+                        : (amps > 4.0 + 1e-6 ? Theme.ACCENT_AMBER : Theme.ACCENT_TEAL);
+                String line = font.plainSubstrByWidth(
+                        SolveResult.formatTierAmperage(entry.getKey(), amps), innerW);
+                gfx.drawString(font, line, padX + 2, cy, ampColor, false);
+                cy += 11;
+                tiersShown++;
+            }
+            cy += 3;
+        } else {
+            cy += 1;
+        }
 
         // Raw Material Imports
         cy = renderResourceSection(gfx, font, Component.translatable("planomega.summary.imports").getString(),

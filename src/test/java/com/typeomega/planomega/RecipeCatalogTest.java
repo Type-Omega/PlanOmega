@@ -80,4 +80,60 @@ class RecipeCatalogTest {
         assertEquals(1, catalog.search("", ResourceKey.item("minecraft:iron_ingot"), null, 1).size());
         assertEquals(0, catalog.search("@minecraft", null, null, 5).size());
     }
+
+    @Test
+    void recipeSwitcherFindsAlternativesByResourceKeyAndTagExcludingCurrent() {
+        RecipeEntry smelterIron = new RecipeEntry(
+                "gtceu:smelter/iron_from_ore",
+                "gtceu:electric_furnace",
+                "gtceu",
+                null,
+                "Iron Ingot (Smelt)",
+                "Electric Furnace",
+                List.of(ResourcePort.input("in_0", ResourceKey.tag("forge:ores/iron"), 1)),
+                List.of(ResourcePort.output("out_0", ResourceKey.item("minecraft:iron_ingot"), 1)),
+                4, 100, 1, null, 0, false, false, 1, null
+        );
+        RecipeEntry arcIron = new RecipeEntry(
+                "gtceu:arc_furnace/iron_from_dust",
+                "gtceu:arc_furnace",
+                "gtceu",
+                null,
+                "Iron Ingot (Arc)",
+                "Arc Furnace",
+                List.of(ResourcePort.input("in_0", ResourceKey.item("gtceu:iron_dust"), 1)),
+                List.of(ResourcePort.output("out_0", ResourceKey.item("minecraft:iron_ingot"), 1)),
+                30, 40, 1, null, 0, false, false, 1, null
+        );
+        RecipeEntry tagIngot = new RecipeEntry(
+                "gtceu:alloy_smelter/tag_ingot",
+                "gtceu:alloy_smelter",
+                "gtceu",
+                null,
+                "Tagged Ingot",
+                "Alloy Smelter",
+                List.of(ResourcePort.input("in_0", ResourceKey.item("minecraft:iron_nugget"), 9)),
+                List.of(ResourcePort.output("out_0", ResourceKey.tag("forge:ingots/iron"), 1)),
+                16, 60, 1, null, 0, false, false, 1, null
+        );
+
+        RecipeCatalog catalog = new RecipeCatalog(List.of(smelterIron, arcIron, tagIngot));
+
+        List<RecipeEntry> alts = catalog.findAlternatives(
+                ResourceKey.item("minecraft:iron_ingot"),
+                "gtceu:smelter/iron_from_ore");
+        assertEquals(1, alts.size());
+        assertEquals("gtceu:arc_furnace/iron_from_dust", alts.get(0).recipeId());
+
+        List<RecipeEntry> tagAlts = catalog.findAlternatives(
+                ResourceKey.tag("forge:ingots/iron"),
+                null);
+        assertEquals(1, tagAlts.size());
+        assertEquals("gtceu:alloy_smelter/tag_ingot", tagAlts.get(0).recipeId());
+
+        List<RecipeEntry> tagStrAlts = catalog.findAlternativesForTag(
+                "#forge:ingots/iron",
+                "gtceu:alloy_smelter/tag_ingot");
+        assertTrue(tagStrAlts.isEmpty());
+    }
 }

@@ -1,5 +1,6 @@
 package com.typeomega.planomega;
 
+import com.typeomega.planomega.client.ui.CanvasLayoutHelper;
 import com.typeomega.planomega.codec.DemoGraphFactory;
 import com.typeomega.planomega.codec.GroupTemplateCodec;
 import com.typeomega.planomega.model.GroupNode;
@@ -157,5 +158,46 @@ class PlanGraphTest {
         PlanGraph.AutoConnectResult withLoops = base.autoConnect(true);
         assertEquals(2, withLoops.connectionsAdded());
         assertEquals(2, withLoops.graph().edges().size());
+    }
+
+    @Test
+    void autoLayoutDagAndCycleTerminateAndArrangeLeftToRight() {
+        // DAG: n1 -> n2 -> n3, placed out of order initially
+        RecipeNode n1 = new RecipeNode(
+                "n1", 600, 300, 0, 0, null, "r:1", "t:1", null, "Step 1",
+                List.of(), List.of(ResourcePort.output("out1", ResourceKey.item("minecraft:iron_ore"), 1)),
+                8, 20, 0, null, 0, false, false, 1, null, null, null
+        );
+        RecipeNode n2 = new RecipeNode(
+                "n2", 100, 300, 0, 0, null, "r:2", "t:2", null, "Step 2",
+                List.of(ResourcePort.input("in2", ResourceKey.item("minecraft:iron_ore"), 1)),
+                List.of(ResourcePort.output("out2", ResourceKey.item("gtceu:iron_dust"), 1)),
+                8, 20, 0, null, 0, false, false, 1, null, null, null
+        );
+        RecipeNode n3 = new RecipeNode(
+                "n3", 0, 0, 0, 0, null, "r:3", "t:3", null, "Step 3",
+                List.of(ResourcePort.input("in3", ResourceKey.item("gtceu:iron_dust"), 1)),
+                List.of(ResourcePort.output("out3", ResourceKey.item("minecraft:iron_ingot"), 1)),
+                8, 20, 0, null, 0, false, false, 1, null, null, null
+        );
+
+        PlanGraph dag = PlanGraph.empty("DAG Layout")
+                .withNode(n1).withNode(n2).withNode(n3)
+                .withEdge(new PlanEdge("e1", "n1", "out1", "n2", "in2", ResourceKey.item("minecraft:iron_ore"), true))
+                .withEdge(new PlanEdge("e2", "n2", "out2", "n3", "in3", ResourceKey.item("gtceu:iron_dust"), true));
+
+        PlanGraph laidOutDag = CanvasLayoutHelper.autoLayoutLeftToRight(dag, false);
+        assertTrue(laidOutDag.nodes().get("n1").x() < laidOutDag.nodes().get("n2").x());
+        assertTrue(laidOutDag.nodes().get("n2").x() < laidOutDag.nodes().get("n3").x());
+
+        // Cycle: n3 -> n1 back-edge added; must terminate cleanly without NaN/Infinite coordinates
+        PlanGraph cyclic = dag.withEdge(new PlanEdge("e_cycle", "n3", "out3", "n1", "in_cycle",
+                ResourceKey.item("minecraft:iron_ingot"), true));
+        PlanGraph laidOutCycle = CanvasLayoutHelper.autoLayoutLeftToRight(cyclic, true);
+        assertEquals(3, laidOutCycle.nodes().size());
+        for (PlanNode node : laidOutCycle.nodes().values()) {
+            assertTrue(Double.isFinite(node.x()));
+            assertTrue(Double.isFinite(node.y()));
+        }
     }
 }

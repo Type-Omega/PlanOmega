@@ -12,6 +12,7 @@ import com.typeomega.planomega.model.PlanEdge;
 import com.typeomega.planomega.model.PlanGraph;
 import com.typeomega.planomega.model.PlanNode;
 import com.typeomega.planomega.model.PortDirection;
+import com.typeomega.planomega.model.ProcessNode.NodeRole;
 import com.typeomega.planomega.model.RecipeNode;
 import com.typeomega.planomega.model.ResourceKey;
 import com.typeomega.planomega.model.ResourceKind;
@@ -206,6 +207,9 @@ public final class PlanCodec {
             if (v.targetPortId() != null) {
                 obj.addProperty("targetPortId", v.targetPortId());
             }
+            if (v.role() != NodeRole.PROCESS) {
+                obj.addProperty("role", v.role().name());
+            }
         } else if (node instanceof StickyNoteNode note) {
             obj.addProperty("type", "sticky_note");
             writeBaseNodeFields(obj, note);
@@ -384,7 +388,8 @@ public final class PlanCodec {
                     getBoolean(obj, "perfectOverclock", false),
                     getString(obj, "notes", ""),
                     getNullableDouble(obj, "targetRate"),
-                    getNullableString(obj, "targetPortId")
+                    getNullableString(obj, "targetPortId"),
+                    NodeRole.fromId(getNullableString(obj, "role"))
             );
             case "sticky_note" -> new StickyNoteNode(
                     id, x, y, width, height, groupId,

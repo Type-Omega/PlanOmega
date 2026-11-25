@@ -14,11 +14,8 @@ import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -179,6 +176,10 @@ public final class CanvasGeometry {
     }
 
     public static @Nullable PlanEdge findEdgeAt(PlanGraph graph, double wx, double wy) {
+        return findEdgeAt(graph, wx, wy, false);
+    }
+
+    public static @Nullable PlanEdge findEdgeAt(PlanGraph graph, double wx, double wy, boolean orthogonal) {
         double maxD2 = EDGE_HIT_DISTANCE * EDGE_HIT_DISTANCE;
         PlanEdge closest = null;
         for (PlanEdge edge : graph.edges().values()) {
@@ -187,13 +188,36 @@ public final class CanvasGeometry {
                 continue;
             }
             EdgeEndpoints pts = ptsOpt.get();
-            double d2 = distanceSqToBezier(wx, wy, pts.start(), pts.end(), 18);
+            double d2 = orthogonal
+                    ? distanceSqToPolyline(wx, wy, sampleOrthogonal(pts.start(), pts.end()))
+                    : distanceSqToBezier(wx, wy, pts.start(), pts.end(), 18);
             if (d2 <= maxD2) {
                 maxD2 = d2;
                 closest = edge;
             }
         }
         return closest;
+    }
+
+    public static List<Vec2> sampleOrthogonal(Vec2 start, Vec2 end) {
+        List<Vec2> pts = new ArrayList<>(6);
+        pts.add(start);
+        if (end.x() >= start.x() + 24.0) {
+            double midX = (start.x() + end.x()) * 0.5;
+            pts.add(new Vec2(midX, start.y()));
+            pts.add(new Vec2(midX, end.y()));
+        } else {
+            double stub = 22.0;
+            double midY = Math.abs(start.y() - end.y()) < 24.0
+                    ? Math.min(start.y(), end.y()) - 48.0
+                    : (start.y() + end.y()) * 0.5;
+            pts.add(new Vec2(start.x() + stub, start.y()));
+            pts.add(new Vec2(start.x() + stub, midY));
+            pts.add(new Vec2(end.x() - stub, midY));
+            pts.add(new Vec2(end.x() - stub, end.y()));
+        }
+        pts.add(end);
+        return pts;
     }
 
     public static List<Vec2> sampleBezier(Vec2 start, Vec2 end, int segments) {
@@ -222,7 +246,10 @@ public final class CanvasGeometry {
     }
 
     private static double distanceSqToBezier(double px, double py, Vec2 start, Vec2 end, int segments) {
-        List<Vec2> pts = sampleBezier(start, end, segments);
+        return distanceSqToPolyline(px, py, sampleBezier(start, end, segments));
+    }
+
+    private static double distanceSqToPolyline(double px, double py, List<Vec2> pts) {
         double best = Double.POSITIVE_INFINITY;
         for (int i = 0; i < pts.size() - 1; i++) {
             best = Math.min(best, distSqPointToSegment(px, py, pts.get(i), pts.get(i + 1)));
@@ -286,284 +313,116 @@ public final class CanvasGeometry {
      * and groups are arranged in columns.
      */
     public static PlanGraph autoLayoutLeftToRight(PlanGraph graph, boolean snapToGrid) {
-        if (graph.nodes().isEmpty()) {
-            return graph;
-        }
-
-        Map<String, PlanNode> working = new LinkedHashMap<>(graph.nodes());
-
-        // 1. Arrange children inside each GroupNode first (if expanded & non-empty)
-        for (PlanNode node : graph.nodes().values()) {
-            if (node instanceof GroupNode group && !group.childNodeIds().isEmpty()) {
-                Set<String> childSet = new LinkedHashSet<>(group.childNodeIds());
-                List<String> validChildren = childSet.stream().filter(working::containsKey).toList();
-                if (validChildren.size() > 1) {
-                    layoutSubset(validChildren, working, graph.edges().values(), 70.0, 26.0, snapToGrid, false);
-                }
-                if (!group.collapsed()) {
-                    working.put(group.id(), recomputeGroupBoundsLocal(group, working));
-                }
-            }
-        }
-
-        // 2. Collect top-level units (all GroupNodes + all ungrouped nodes)
-        List<String> topUnits = new ArrayList<>();
-        for (PlanNode node : working.values()) {
-            if (node instanceof GroupNode || node.groupId() == null) {
-                topUnits.add(node.id());
-            }
-        }
-
-        // Map any node ID to its top-level unit ID
-        Map<String, String> toTopUnit = new HashMap<>();
-        for (PlanNode node : working.values()) {
-            String top = node.id();
-            Set<String> seen = new HashSet<>();
-            PlanNode cur = node;
-            while (cur != null && cur.groupId() != null && seen.add(cur.groupId())) {
-                top = cur.groupId();
-                cur = working.get(top);
-            }
-            toTopUnit.put(node.id(), top);
-        }
-
-        // Build top-level edges
-        List<PlanEdge> topEdges = new ArrayList<>();
-        for (PlanEdge e : graph.edges().values()) {
-            String fromTop = toTopUnit.get(e.fromNodeId());
-            String toTop = toTopUnit.get(e.toNodeId());
-            if (fromTop != null && toTop != null && !fromTop.equals(toTop)) {
-                topEdges.add(new PlanEdge(e.id(), fromTop, e.fromPortId(), toTop, e.toPortId(), e.resource(), e.manualLock()));
-            }
-        }
-
-        layoutSubset(topUnits, working, topEdges, 90.0, 32.0, snapToGrid, true);
-
-        return new PlanGraph(
-                graph.schemaVersion(),
-                graph.id(),
-                graph.name(),
-                graph.author(),
-                graph.description(),
-                working,
-                graph.edges()
-        );
+        return CanvasLayoutHelper.autoLayoutLeftToRight(graph, snapToGrid);
     }
 
-    private static void layoutSubset(
-            List<String> unitIds,
-            Map<String, PlanNode> working,
-            java.util.Collection<PlanEdge> edges,
-            double gapX,
-            double gapY,
-            boolean snapToGrid,
-            boolean moveGroupChildren
+    public static FlowHighlight computeFlowHighlight(
+            PlanGraph graph,
+            @Nullable String hoveredNodeId,
+            @Nullable String hoveredEdgeId,
+            @Nullable PortHit hoveredPort
     ) {
-        if (unitIds.isEmpty()) {
-            return;
+        if (hoveredNodeId == null && hoveredEdgeId == null && hoveredPort == null) {
+            return FlowHighlight.EMPTY;
         }
-        Set<String> unitSet = new LinkedHashSet<>(unitIds);
-        Map<String, List<String>> adj = new LinkedHashMap<>();
-        Map<String, List<String>> revAdj = new LinkedHashMap<>();
-        Map<String, Integer> inDegree = new LinkedHashMap<>();
-        for (String id : unitSet) {
-            adj.put(id, new ArrayList<>());
-            revAdj.put(id, new ArrayList<>());
-            inDegree.put(id, 0);
+        Set<String> nodeIds = new HashSet<>();
+        Set<String> edgeIds = new HashSet<>();
+
+        Map<String, List<PlanEdge>> outEdges = new HashMap<>();
+        Map<String, List<PlanEdge>> inEdges = new HashMap<>();
+        for (PlanEdge edge : graph.edges().values()) {
+            outEdges.computeIfAbsent(edge.fromNodeId(), k -> new ArrayList<>()).add(edge);
+            inEdges.computeIfAbsent(edge.toNodeId(), k -> new ArrayList<>()).add(edge);
         }
 
-        Set<String> seenEdgePairs = new HashSet<>();
-        for (PlanEdge edge : edges) {
-            if (!unitSet.contains(edge.fromNodeId()) || !unitSet.contains(edge.toNodeId())) {
-                continue;
-            }
-            if (edge.fromNodeId().equals(edge.toNodeId())) {
-                continue;
-            }
-            String pair = edge.fromNodeId() + "->" + edge.toNodeId();
-            if (seenEdgePairs.add(pair)) {
-                adj.get(edge.fromNodeId()).add(edge.toNodeId());
-                revAdj.get(edge.toNodeId()).add(edge.fromNodeId());
-                inDegree.put(edge.toNodeId(), inDegree.get(edge.toNodeId()) + 1);
-            }
-        }
+        Queue<String> upQueue = new ArrayDeque<>();
+        Queue<String> downQueue = new ArrayDeque<>();
 
-        // Longest-path topological layering with cycle breaking
-        Map<String, Integer> layer = new LinkedHashMap<>();
-        Queue<String> ready = new ArrayDeque<>();
-        for (String id : unitSet) {
-            if (inDegree.get(id) == 0) {
-                ready.add(id);
-                layer.put(id, 0);
-            }
-        }
-
-        Set<String> placed = new HashSet<>();
-        while (placed.size() < unitSet.size()) {
-            if (ready.isEmpty()) {
-                // Cycle fallback: pick unplaced node with smallest remaining in-degree
-                String pick = null;
-                int bestDeg = Integer.MAX_VALUE;
-                for (String id : unitSet) {
-                    if (!placed.contains(id) && inDegree.get(id) < bestDeg) {
-                        bestDeg = inDegree.get(id);
-                        pick = id;
-                    }
+        if (hoveredEdgeId != null) {
+            PlanEdge edge = graph.edges().get(hoveredEdgeId);
+            if (edge != null) {
+                edgeIds.add(edge.id());
+                if (nodeIds.add(edge.fromNodeId())) {
+                    upQueue.add(edge.fromNodeId());
                 }
-                if (pick == null) {
-                    break;
-                }
-                int maxPredLayer = -1;
-                for (String pred : revAdj.get(pick)) {
-                    if (placed.contains(pred)) {
-                        maxPredLayer = Math.max(maxPredLayer, layer.getOrDefault(pred, 0));
-                    }
-                }
-                layer.put(pick, maxPredLayer + 1);
-                ready.add(pick);
-            }
-
-            String u = ready.poll();
-            if (!placed.add(u)) {
-                continue;
-            }
-            int uLayer = layer.getOrDefault(u, 0);
-            for (String v : adj.get(u)) {
-                if (!placed.contains(v)) {
-                    layer.put(v, Math.max(layer.getOrDefault(v, 0), uLayer + 1));
-                    int deg = inDegree.get(v) - 1;
-                    inDegree.put(v, deg);
-                    if (deg <= 0) {
-                        ready.add(v);
-                    }
+                if (nodeIds.add(edge.toNodeId())) {
+                    downQueue.add(edge.toNodeId());
                 }
             }
-        }
-
-        int maxLayer = 0;
-        for (int l : layer.values()) {
-            maxLayer = Math.max(maxLayer, l);
-        }
-
-        List<List<String>> columns = new ArrayList<>(maxLayer + 1);
-        for (int i = 0; i <= maxLayer; i++) {
-            columns.add(new ArrayList<>());
-        }
-        for (String id : unitSet) {
-            columns.get(layer.getOrDefault(id, 0)).add(id);
-        }
-
-        // Barycenter ordering per column to minimize crossings
-        Map<String, Double> tempY = new HashMap<>();
-        for (String id : unitSet) {
-            tempY.put(id, working.get(id).y());
-        }
-
-        double curX = 0.0;
-        for (int colIdx = 0; colIdx < columns.size(); colIdx++) {
-            List<String> col = columns.get(colIdx);
-            if (col.isEmpty()) {
-                continue;
-            }
-            if (colIdx > 0) {
-                final int currentCol = colIdx;
-                col.sort(Comparator.comparingDouble(id -> {
-                    List<String> preds = revAdj.get(id);
-                    if (preds.isEmpty()) {
-                        return tempY.getOrDefault(id, 0.0);
-                    }
-                    double sum = 0.0;
-                    int count = 0;
-                    for (String p : preds) {
-                        if (layer.getOrDefault(p, 0) < currentCol) {
-                            sum += tempY.getOrDefault(p, 0.0);
-                            count++;
+        } else if (hoveredPort != null) {
+            String hostId = hoveredPort.nodeId();
+            nodeIds.add(hostId);
+            if (hoveredPort.port().direction() == PortDirection.INPUT) {
+                for (PlanEdge e : inEdges.getOrDefault(hostId, List.of())) {
+                    if (e.toPortId().equals(hoveredPort.port().id())) {
+                        edgeIds.add(e.id());
+                        if (nodeIds.add(e.fromNodeId())) {
+                            upQueue.add(e.fromNodeId());
                         }
                     }
-                    return count > 0 ? sum / count : tempY.getOrDefault(id, 0.0);
-                }));
+                }
             } else {
-                col.sort(Comparator.comparingDouble(id -> working.get(id).y()));
-            }
-
-            double totalH = 0.0;
-            double maxW = 0.0;
-            for (int i = 0; i < col.size(); i++) {
-                PlanNode n = working.get(col.get(i));
-                totalH += visualHeight(n);
-                if (i > 0) {
-                    totalH += gapY;
+                for (PlanEdge e : outEdges.getOrDefault(hostId, List.of())) {
+                    if (e.fromPortId().equals(hoveredPort.port().id())) {
+                        edgeIds.add(e.id());
+                        if (nodeIds.add(e.toNodeId())) {
+                            downQueue.add(e.toNodeId());
+                        }
+                    }
                 }
-                maxW = Math.max(maxW, visualWidth(n));
             }
-
-            double curY = -totalH * 0.5;
-            for (String id : col) {
-                PlanNode n = working.get(id);
-                double nx = CanvasViewport.snap(curX, snapToGrid);
-                double ny = CanvasViewport.snap(curY, snapToGrid);
-                double dx = nx - n.x();
-                double dy = ny - n.y();
-                working.put(id, n.withPosition(nx, ny));
-                tempY.put(id, ny);
-
-                if (moveGroupChildren && n instanceof GroupNode group) {
-                    shiftGroupDescendants(group, dx, dy, working);
+        } else if (hoveredNodeId != null) {
+            PlanNode hovered = graph.nodes().get(hoveredNodeId);
+            if (hovered instanceof GroupNode group) {
+                for (String childId : group.childNodeIds()) {
+                    if (nodeIds.add(childId)) {
+                        upQueue.add(childId);
+                        downQueue.add(childId);
+                    }
                 }
-
-                curY += visualHeight(n) + gapY;
+                nodeIds.add(group.id());
+            } else {
+                nodeIds.add(hoveredNodeId);
+                upQueue.add(hoveredNodeId);
+                downQueue.add(hoveredNodeId);
             }
-            curX += maxW + gapX;
         }
-    }
 
-    private static void shiftGroupDescendants(GroupNode group, double dx, double dy, Map<String, PlanNode> working) {
-        if (dx == 0.0 && dy == 0.0) {
-            return;
-        }
-        for (String childId : group.childNodeIds()) {
-            PlanNode child = working.get(childId);
-            if (child != null) {
-                working.put(childId, child.withPosition(child.x() + dx, child.y() + dy));
-                if (child instanceof GroupNode nested) {
-                    shiftGroupDescendants(nested, dx, dy, working);
+        Set<String> visitedUp = new HashSet<>(upQueue);
+        while (!upQueue.isEmpty()) {
+            String cur = upQueue.poll();
+            for (PlanEdge e : inEdges.getOrDefault(cur, List.of())) {
+                edgeIds.add(e.id());
+                nodeIds.add(e.fromNodeId());
+                if (visitedUp.add(e.fromNodeId())) {
+                    upQueue.add(e.fromNodeId());
                 }
             }
         }
-    }
 
-    private static GroupNode recomputeGroupBoundsLocal(GroupNode group, Map<String, PlanNode> working) {
-        double minX = Double.POSITIVE_INFINITY;
-        double minY = Double.POSITIVE_INFINITY;
-        double maxX = Double.NEGATIVE_INFINITY;
-        double maxY = Double.NEGATIVE_INFINITY;
-        for (String childId : group.childNodeIds()) {
-            PlanNode child = working.get(childId);
-            if (child == null) {
-                continue;
+        Set<String> visitedDown = new HashSet<>(downQueue);
+        while (!downQueue.isEmpty()) {
+            String cur = downQueue.poll();
+            for (PlanEdge e : outEdges.getOrDefault(cur, List.of())) {
+                edgeIds.add(e.id());
+                nodeIds.add(e.toNodeId());
+                if (visitedDown.add(e.toNodeId())) {
+                    downQueue.add(e.toNodeId());
+                }
             }
-            minX = Math.min(minX, child.x());
-            minY = Math.min(minY, child.y());
-            maxX = Math.max(maxX, child.x() + child.width());
-            maxY = Math.max(maxY, child.y() + child.height());
         }
-        if (!Double.isFinite(minX)) {
-            return group;
-        }
-        return new GroupNode(
-                group.id(),
-                minX - 18.0,
-                minY - 34.0,
-                (maxX - minX) + 36.0,
-                (maxY - minY) + 50.0,
-                group.groupId(),
-                group.title(),
-                group.color(),
-                group.collapsed(),
-                group.childNodeIds()
-        );
+
+        return new FlowHighlight(nodeIds, edgeIds);
     }
 
     public record EdgeEndpoints(Vec2 start, Vec2 end) {
+    }
+
+    public record FlowHighlight(Set<String> nodeIds, Set<String> edgeIds) {
+        public static final FlowHighlight EMPTY = new FlowHighlight(Set.of(), Set.of());
+
+        public boolean isActive() {
+            return !nodeIds.isEmpty() || !edgeIds.isEmpty();
+        }
     }
 }

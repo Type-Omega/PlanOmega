@@ -3,6 +3,7 @@ package com.typeomega.planomega;
 import com.typeomega.planomega.audit.AuditReport;
 import com.typeomega.planomega.audit.ChainAuditor;
 import com.typeomega.planomega.audit.FrictionFlag.Category;
+import com.typeomega.planomega.audit.FrictionFlag.Severity;
 import com.typeomega.planomega.codec.DemoGraphFactory;
 import com.typeomega.planomega.export.AiAnalysisExporter;
 import com.typeomega.planomega.export.MermaidExporter;
@@ -205,5 +206,36 @@ class AuditAndExportTest {
         assertTrue(overwrite.saved());
         assertNotNull(overwrite.backupPath());
         assertTrue(Files.exists(overwrite.backupPath()));
+    }
+
+    @Test
+    void auditorFlagsElectricalSpikesAbove4AAnd16A() {
+        // LV (32 EU/t): 30 EU/t * 6 machines = 180 EU/t -> 5.625A (>4A WARNING)
+        RecipeNode warnNode = new RecipeNode(
+                "warn_amp", 0, 0, 0, 0, null, "gtceu:macerator/warn", "gtceu:macerator", null, "Warn Macerator",
+                List.of(ResourcePort.input("in", ResourceKey.item("minecraft:cobblestone"), 1)),
+                List.of(ResourcePort.output("out", ResourceKey.item("minecraft:sand"), 1)),
+                30, 20, 1, null, 0, false, false, 1, 6.0, "out", null
+        );
+        // LV (32 EU/t): 30 EU/t * 20 machines = 600 EU/t -> 18.75A (>16A CRITICAL)
+        RecipeNode critNode = new RecipeNode(
+                "crit_amp", 250, 0, 0, 0, null, "gtceu:macerator/crit", "gtceu:macerator", null, "Crit Macerator",
+                List.of(ResourcePort.input("in", ResourceKey.item("minecraft:gravel"), 1)),
+                List.of(ResourcePort.output("out", ResourceKey.item("minecraft:flint"), 1)),
+                30, 20, 1, null, 0, false, false, 1, 20.0, "out", null
+        );
+
+        PlanGraph graph = PlanGraph.empty("Spike Audit").withNode(warnNode).withNode(critNode);
+        SolveResult solve = ProductionSolver.solve(graph);
+        AuditReport report = ChainAuditor.audit(graph, solve);
+
+        assertTrue(report.flags().stream().anyMatch(f ->
+                f.category() == Category.ELECTRICAL_SPIKE
+                        && f.severity() == Severity.WARNING
+                        && "warn_amp".equals(f.nodeId())));
+        assertTrue(report.flags().stream().anyMatch(f ->
+                f.category() == Category.ELECTRICAL_SPIKE
+                        && f.severity() == Severity.CRITICAL
+                        && "crit_amp".equals(f.nodeId())));
     }
 }

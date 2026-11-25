@@ -1,5 +1,6 @@
 package com.typeomega.planomega.client.ui;
 
+import com.typeomega.planomega.model.RecipeNode;
 import com.typeomega.planomega.model.ResourceKey;
 import com.typeomega.planomega.model.ResourcePort;
 import com.typeomega.planomega.model.VoltageTier;
@@ -26,6 +27,11 @@ import java.util.function.Consumer;
  */
 public final class RecipeSearchModal extends PlannerModal {
 
+    public enum Mode {
+        ADD,
+        SWITCH
+    }
+
     private static final int ROW_HEIGHT = 28;
     private static final int VISIBLE_ROWS = 7;
     private static final int LIST_TOP_OFFSET = 76;
@@ -35,6 +41,10 @@ public final class RecipeSearchModal extends PlannerModal {
     private final @Nullable ResourceKey producedFilter;
     private final @Nullable ResourceKey consumedFilter;
     private final String initialQuery;
+    private final Mode mode;
+    private final @Nullable String currentRecipeId;
+    private final @Nullable String currentRecipeTitle;
+    private final @Nullable RecipeNode sourceNode;
     private final Consumer<RecipeEntry> onSelect;
 
     private EditBox searchBox;
@@ -50,11 +60,117 @@ public final class RecipeSearchModal extends PlannerModal {
             @Nullable String initialQuery,
             Consumer<RecipeEntry> onSelect
     ) {
+        this(producedFilter, consumedFilter, initialQuery, Mode.ADD, null, null, null, onSelect);
+    }
+
+    public RecipeSearchModal(
+            @Nullable ResourceKey producedFilter,
+            @Nullable ResourceKey consumedFilter,
+            @Nullable String initialQuery,
+            Mode mode,
+            @Nullable String currentRecipeId,
+            @Nullable String currentRecipeTitle,
+            Consumer<RecipeEntry> onSelect
+    ) {
+        this(producedFilter, consumedFilter, initialQuery, mode, currentRecipeId, currentRecipeTitle, null, onSelect);
+    }
+
+    private RecipeSearchModal(
+            @Nullable ResourceKey producedFilter,
+            @Nullable ResourceKey consumedFilter,
+            @Nullable String initialQuery,
+            Mode mode,
+            @Nullable String currentRecipeId,
+            @Nullable String currentRecipeTitle,
+            @Nullable RecipeNode sourceNode,
+            Consumer<RecipeEntry> onSelect
+    ) {
         super(470, 310);
         this.producedFilter = producedFilter;
         this.consumedFilter = consumedFilter;
         this.initialQuery = initialQuery == null ? "" : initialQuery;
+        this.mode = mode == null ? Mode.ADD : mode;
+        this.currentRecipeId = currentRecipeId;
+        this.currentRecipeTitle = currentRecipeTitle;
+        this.sourceNode = sourceNode;
         this.onSelect = onSelect;
+    }
+
+    public static RecipeSearchModal forSwitch(
+            @Nullable ResourceKey producedFilter,
+            @Nullable String currentRecipeId,
+            @Nullable String currentRecipeTitle,
+            Consumer<RecipeEntry> onSelect
+    ) {
+        return new RecipeSearchModal(
+                producedFilter,
+                null,
+                "",
+                Mode.SWITCH,
+                currentRecipeId,
+                currentRecipeTitle,
+                null,
+                onSelect
+        );
+    }
+
+    public static RecipeSearchModal forSwitch(
+            RecipeNode node,
+            Consumer<RecipeEntry> onSelect
+    ) {
+        ResourceKey primaryOutput = node.outputs().isEmpty() ? null : node.outputs().get(0).resource();
+        return new RecipeSearchModal(
+                primaryOutput,
+                null,
+                "",
+                Mode.SWITCH,
+                node.recipeId(),
+                node.title(),
+                node,
+                onSelect
+        );
+    }
+
+    /**
+     * Builds a replacement {@link RecipeNode} from {@code newRecipe} while preserving
+     * {@code oldNode}'s position, group, target rate, locked rate, tier, coil, and parallel context.
+     */
+    public static RecipeNode applySwitchToNode(RecipeNode oldNode, RecipeEntry newRecipe) {
+        return new RecipeNode(
+                oldNode.id(),
+                oldNode.x(),
+                oldNode.y(),
+                0,
+                0,
+                oldNode.groupId(),
+                newRecipe.recipeId(),
+                newRecipe.recipeTypeId(),
+                newRecipe.machineId(),
+                newRecipe.title(),
+                newRecipe.inputs(),
+                newRecipe.outputs(),
+                newRecipe.eut(),
+                newRecipe.durationTicks(),
+                oldNode.tier() > 0 ? oldNode.tier() : newRecipe.tier(),
+                newRecipe.circuit(),
+                newRecipe.coilTemp(),
+                newRecipe.cleanroom(),
+                newRecipe.perfectOverclock(),
+                newRecipe.parallelLimit(),
+                oldNode.targetRate(),
+                oldNode.targetPortId(),
+                oldNode.lockedRate(),
+                oldNode.coilTier(),
+                oldNode.parallelCount()
+        );
+    }
+
+    public Mode getMode() {
+        return mode;
+    }
+
+    public @Nullable RecipeNode getSourceNode() {
+        return sourceNode;
     }
 
     @Override
@@ -113,7 +229,29 @@ public final class RecipeSearchModal extends PlannerModal {
     private void refreshResults() {
         RecipeCatalog catalog = RecipeCatalogManager.get();
         String q = searchBox != null ? searchBox.getValue() : initialQuery;
-        this.results = catalog.search(q, producedFilter, consumedFilter, 120);
+        if (mode == Mode.SWITCH) {
+            List<RecipeEntry> raw;
+            if ((q == null || q.isBlank()) && producedFilter != null) {
+                raw = catalog.findAlternatives(producedFilter, currentRecipeId);
+                if (raw.size() > 120) {
+                    raw = raw.subList(0, 120);
+                }
+            } else {
+                raw = catalog.search(q, producedFilter, consumedFilter, 120);
+                if (currentRecipeId != null && !currentRecipeId.isBlank()) {
+                    List<RecipeEntry> filtered = new ArrayList<>(raw.size());
+                    for (RecipeEntry entry : raw) {
+                        if (!entry.recipeId().equals(currentRecipeId)) {
+                            filtered.add(entry);
+                        }
+                    }
+                    raw = filtered;
+                }
+            }
+            this.results = raw;
+        } else {
+            this.results = catalog.search(q, producedFilter, consumedFilter, 120);
+        }
         this.scrollOffset = 0;
         this.selectedIndex = results.isEmpty() ? -1 : 0;
     }
@@ -121,7 +259,12 @@ public final class RecipeSearchModal extends PlannerModal {
     @Override
     protected void renderContents(GuiGraphics gfx, Font font, int x, int y, int mouseX, int mouseY, float partialTick) {
         String header;
-        if (producedFilter != null) {
+        if (mode == Mode.SWITCH) {
+            String contextLabel = currentRecipeTitle != null && !currentRecipeTitle.isBlank()
+                    ? currentRecipeTitle
+                    : (producedFilter != null ? producedFilter.shortName() : "");
+            header = Component.translatable("planomega.modal.recipe.switch_title", contextLabel).getString();
+        } else if (producedFilter != null) {
             header = Component.translatable("planomega.modal.recipe.producers_of", producedFilter.shortName()).getString();
         } else if (consumedFilter != null) {
             header = Component.translatable("planomega.modal.recipe.consumers_of", consumedFilter.shortName()).getString();
@@ -154,7 +297,10 @@ public final class RecipeSearchModal extends PlannerModal {
 
         int listTop = y + LIST_TOP_OFFSET;
         if (results.isEmpty()) {
-            gfx.drawString(font, Component.translatable("planomega.modal.recipe.empty").getString(),
+            String emptyKey = mode == Mode.SWITCH
+                    ? "planomega.modal.recipe.switch_empty"
+                    : "planomega.modal.recipe.empty";
+            gfx.drawString(font, Component.translatable(emptyKey).getString(),
                     x + 16, listTop + 12, Theme.TEXT_MUTED, false);
             return;
         }

@@ -3,6 +3,7 @@ package com.typeomega.planomega.integration;
 import com.typeomega.planomega.PlanOmega;
 import com.typeomega.planomega.integration.ae2.Ae2Bridge;
 import com.typeomega.planomega.integration.emi.EmiLookupHelper;
+import com.typeomega.planomega.integration.emi.EmiTreeImporter;
 import com.typeomega.planomega.integration.jei.JeiPlanOmegaPlugin;
 import com.typeomega.planomega.model.PlanGraph;
 import com.typeomega.planomega.model.ResourceKey;
@@ -49,6 +50,42 @@ public final class IntegrationBridge {
             }
         }
         return Optional.empty();
+    }
+
+    public static boolean hasActiveEmiTree() {
+        if (!ModList.get().isLoaded("emi")) {
+            return false;
+        }
+        try {
+            return EmiTreeImporter.hasActiveTree();
+        } catch (Throwable t) {
+            PlanOmega.LOGGER.debug("EMI tree check failed", t);
+            return false;
+        }
+    }
+
+    public static Optional<PlanGraph> importActiveEmiTree() {
+        if (!ModList.get().isLoaded("emi")) {
+            return Optional.empty();
+        }
+        try {
+            return EmiTreeImporter.importActiveTree();
+        } catch (Throwable t) {
+            PlanOmega.LOGGER.debug("EMI tree import failed", t);
+            return Optional.empty();
+        }
+    }
+
+    public static boolean enqueueActiveEmiTree() {
+        if (!ModList.get().isLoaded("emi")) {
+            return false;
+        }
+        try {
+            return EmiTreeImporter.enqueueActiveTree();
+        } catch (Throwable t) {
+            PlanOmega.LOGGER.debug("EMI tree enqueue failed", t);
+            return false;
+        }
     }
 
     public static boolean isAe2Available() {

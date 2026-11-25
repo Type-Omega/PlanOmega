@@ -40,6 +40,7 @@ public record FrictionFlag(
         BOTTLENECK_MACHINES,
         BOTTLENECK_TIME,
         BOTTLENECK_HATCH,
+        ELECTRICAL_SPIKE,
         REDUNDANT_PASSTHROUGH,
         ARTIFICIAL_JUMP,
         RECYCLE_IMBALANCE

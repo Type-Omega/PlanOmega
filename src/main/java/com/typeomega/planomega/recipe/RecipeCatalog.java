@@ -71,6 +71,86 @@ public final class RecipeCatalog {
     }
 
     /**
+     * Finds alternative recipes that produce the given {@link ResourceKey} (or {@code #tag} if
+     * {@code targetOutput.kind() == ResourceKind.TAG}), optionally excluding {@code excludeRecipeId}.
+     */
+    public List<RecipeEntry> findAlternatives(
+            @Nullable ResourceKey targetOutput,
+            @Nullable String excludeRecipeId
+    ) {
+        if (targetOutput == null) {
+            return List.of();
+        }
+        if (targetOutput.kind() == ResourceKind.TAG) {
+            return findAlternativesForTag(targetOutput.id(), excludeRecipeId);
+        }
+        List<RecipeEntry> producers = producersOf(targetOutput);
+        if (producers.isEmpty()) {
+            return List.of();
+        }
+        if (excludeRecipeId == null || excludeRecipeId.isBlank()) {
+            return producers;
+        }
+        List<RecipeEntry> filtered = new ArrayList<>(producers.size());
+        for (RecipeEntry entry : producers) {
+            if (!entry.recipeId().equals(excludeRecipeId)) {
+                filtered.add(entry);
+            }
+        }
+        return filtered;
+    }
+
+    /**
+     * Finds alternative recipes that produce an output matching the given {@code #tag}
+     * (with or without leading {@code #}), optionally excluding {@code excludeRecipeId}.
+     */
+    public List<RecipeEntry> findAlternativesForTag(
+            @Nullable String tagFilter,
+            @Nullable String excludeRecipeId
+    ) {
+        if (tagFilter == null || tagFilter.isBlank()) {
+            return List.of();
+        }
+        String normalized = tagFilter.trim().toLowerCase(Locale.ROOT);
+        if (normalized.startsWith("#")) {
+            normalized = normalized.substring(1);
+        }
+        if (normalized.isEmpty()) {
+            return List.of();
+        }
+        List<RecipeEntry> exactMatches = new ArrayList<>();
+        List<RecipeEntry> partialMatches = new ArrayList<>();
+        for (RecipeEntry entry : allRecipes) {
+            if (excludeRecipeId != null && entry.recipeId().equals(excludeRecipeId)) {
+                continue;
+            }
+            boolean exact = false;
+            boolean partial = false;
+            for (ResourcePort out : entry.outputs()) {
+                if (out.resource().kind() == ResourceKind.TAG) {
+                    String outTag = out.resource().id().toLowerCase(Locale.ROOT);
+                    if (outTag.equals(normalized)) {
+                        exact = true;
+                        break;
+                    } else if (outTag.contains(normalized)) {
+                        partial = true;
+                    }
+                }
+            }
+            if (exact) {
+                exactMatches.add(entry);
+            } else if (partial) {
+                partialMatches.add(entry);
+            }
+        }
+        if (partialMatches.isEmpty()) {
+            return exactMatches;
+        }
+        exactMatches.addAll(partialMatches);
+        return exactMatches;
+    }
+
+    /**
      * Searches recipes matching the query string, optionally restricted to producers of {@code producedResource}
      * or consumers of {@code consumedResource}, ranked by relevance (exact title/output matches first).
      */

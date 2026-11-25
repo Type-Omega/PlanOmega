@@ -20,6 +20,27 @@ public sealed interface ProcessNode extends PlanNode permits RecipeNode, Virtual
     List<Integer> PARALLEL_OPTIONS = List.of(1, 4, 16, 64, 256);
 
     /**
+     * Role of a process node in the production graph.
+     */
+    enum NodeRole {
+        PROCESS,
+        SOURCE,
+        SINK;
+
+        public static NodeRole fromId(@Nullable String raw) {
+            if (raw == null || raw.isBlank()) {
+                return PROCESS;
+            }
+            for (NodeRole r : values()) {
+                if (r.name().equalsIgnoreCase(raw.trim())) {
+                    return r;
+                }
+            }
+            return PROCESS;
+        }
+    }
+
+    /**
      * GTCEu Modern heating coil tiers for EBF, Pyrolyse Oven, and Cracker multiblocks.
      */
     enum CoilTier {
@@ -112,6 +133,15 @@ public sealed interface ProcessNode extends PlanNode permits RecipeNode, Virtual
 
     default boolean isVirtual() {
         return this instanceof VirtualRecipeNode;
+    }
+
+    default NodeRole role() {
+        return NodeRole.PROCESS;
+    }
+
+    default boolean isExternalIo() {
+        NodeRole r = role();
+        return r == NodeRole.SOURCE || r == NodeRole.SINK;
     }
 
     default Optional<ResourcePort> findPort(String portId) {

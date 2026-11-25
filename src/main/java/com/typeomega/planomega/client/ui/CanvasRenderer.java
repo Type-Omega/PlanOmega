@@ -61,9 +61,12 @@ public final class CanvasRenderer {
             double mouseWorldX,
             double mouseWorldY,
             boolean showGrid,
+            boolean orthogonalRouting,
             @Nullable double[] marqueeWorldBounds,
             @Nullable SolveResult solveResult,
-            @Nullable AuditReport auditReport
+            @Nullable AuditReport auditReport,
+            Set<String> searchMatchedNodeIds,
+            @Nullable String activeSearchNodeId
     ) {
     }
 
@@ -76,6 +79,10 @@ public final class CanvasRenderer {
         if (ctx.showGrid()) {
             drawGrid(gfx, vp);
         }
+
+        CanvasGeometry.FlowHighlight flowHighlight = CanvasGeometry.computeFlowHighlight(
+                ctx.graph(), ctx.hoveredNodeId(), ctx.hoveredEdgeId(), ctx.hoveredPort()
+        );
 
         PoseStack pose = gfx.pose();
         pose.pushPose();
@@ -99,26 +106,34 @@ public final class CanvasRenderer {
             EdgeEndpoints pts = ptsOpt.get();
             boolean selected = edge.id().equals(ctx.selectedEdgeId());
             boolean hovered = edge.id().equals(ctx.hoveredEdgeId());
+            boolean inFlow = flowHighlight.isActive() && flowHighlight.edgeIds().contains(edge.id());
+            boolean dimmedByFlow = flowHighlight.isActive() && !inFlow && !selected;
+
             int color = edge.resource().kind().color();
             if (selected) {
                 color = Theme.ACCENT_TEAL;
             } else if (hovered) {
                 color = 0xFFFFFFFF;
+            } else if (dimmedByFlow) {
+                color = Theme.withAlpha(color, 0x45);
             }
-            float thickness = (selected || hovered) ? 3.2f : 2.1f;
-            drawBezierWire(pose, pts.start(), pts.end(), color, thickness);
+            float thickness = (selected || hovered) ? 3.2f : (inFlow ? 2.9f : (dimmedByFlow ? 1.5f : 2.1f));
+            List<Vec2> wirePoints = ctx.orthogonalRouting()
+                    ? CanvasGeometry.sampleOrthogonal(pts.start(), pts.end())
+                    : CanvasGeometry.sampleBezier(pts.start(), pts.end(), 24);
+            drawWire(pose, wirePoints, color, thickness);
 
             if (ctx.solveResult() != null && ctx.solveResult().isSolved() && ctx.viewport().zoom() >= 0.55) {
                 Double flow = ctx.solveResult().edgeFlows().get(edge.id());
                 if (flow != null && flow > 1e-6) {
-                    Vec2 mid = new Vec2((pts.start().x() + pts.end().x()) * 0.5, (pts.start().y() + pts.end().y()) * 0.5);
+                    Vec2 mid = wireMidpoint(wirePoints, pts.start(), pts.end());
                     String flowText = edge.resource().kind() == ResourceKind.FLUID
                             ? AMOUNT_FMT.format(flow) + " mB/s"
                             : AMOUNT_FMT.format(flow) + "/s";
                     int fw = font.width(flowText);
                     int lx = (int) Math.round(mid.x() - fw * 0.5);
                     int ly = (int) Math.round(mid.y() - 12);
-                    gfx.fill(lx - 3, ly - 1, lx + fw + 3, ly + 9, 0xCC0D1117);
+                    gfx.fill(lx - 3, ly - 1, lx + fw + 3, ly + 9, dimmedByFlow ? 0x660D1117 : 0xCC0D1117);
                     gfx.drawString(font, flowText, lx, ly, color, false);
                 }
             }
@@ -134,7 +149,10 @@ public final class CanvasRenderer {
                 start = end;
                 end = tmp;
             }
-            drawBezierWire(pose, start, end, src.port().resource().kind().color(), 2.6f);
+            List<Vec2> previewPoints = ctx.orthogonalRouting()
+                    ? CanvasGeometry.sampleOrthogonal(start, end)
+                    : CanvasGeometry.sampleBezier(start, end, 24);
+            drawWire(pose, previewPoints, src.port().resource().kind().color(), 2.6f);
         }
 
         // 4. Process nodes and sticky notes
@@ -143,7 +161,7 @@ public final class CanvasRenderer {
                 continue;
             }
             if (node instanceof ProcessNode proc) {
-                drawProcessNode(gfx, font, proc, ctx);
+                drawProcessNode(gfx, font, proc, ctx, flowHighlight);
             } else if (node instanceof StickyNoteNode note) {
                 drawStickyNote(gfx, font, note, ctx);
             }
@@ -278,10 +296,14 @@ public final class CanvasRenderer {
             int y1 = mm.y() + (int) Math.round((node.y() - mm.worldMinY()) / spanY * mm.h());
             int w = Math.max(3, (int) Math.round(CanvasGeometry.visualWidth(node) / spanX * mm.w()));
             int h = Math.max(3, (int) Math.round(CanvasGeometry.visualHeight(node) / spanY * mm.h()));
-            int color = ctx.selectedNodeIds().contains(node.id())
+            int color = node.id().equals(ctx.activeSearchNodeId())
+                    ? 0xFFFBBF24
+                    : (ctx.searchMatchedNodeIds().contains(node.id())
+                    ? Theme.ACCENT_AMBER
+                    : (ctx.selectedNodeIds().contains(node.id())
                     ? Theme.ACCENT_TEAL
                     : (node instanceof ProcessNode p && p.isVirtual() ? Theme.ACCENT_AMBER
-                    : (node instanceof StickyNoteNode ? 0xFFFDE68A : 0xFF64748B));
+                    : (node instanceof StickyNoteNode ? 0xFFFDE68A : 0xFF64748B))));
             gfx.fill(x1, y1, x1 + w, y1 + h, color);
         }
 
@@ -363,7 +385,13 @@ public final class CanvasRenderer {
         }
     }
 
-    private static void drawProcessNode(GuiGraphics gfx, Font font, ProcessNode node, RenderContext ctx) {
+    private static void drawProcessNode(
+            GuiGraphics gfx,
+            Font font,
+            ProcessNode node,
+            RenderContext ctx,
+            CanvasGeometry.FlowHighlight flowHighlight
+    ) {
         int x = (int) Math.round(node.x());
         int y = (int) Math.round(node.y());
         int w = (int) Math.round(node.width());
@@ -371,11 +399,24 @@ public final class CanvasRenderer {
 
         boolean selected = ctx.selectedNodeIds().contains(node.id());
         boolean hovered = node.id().equals(ctx.hoveredNodeId());
+        boolean inFlow = flowHighlight.isActive() && flowHighlight.nodeIds().contains(node.id());
+        boolean activeSearch = node.id().equals(ctx.activeSearchNodeId());
+        boolean searchMatch = ctx.searchMatchedNodeIds().contains(node.id());
         boolean virtual = node.isVirtual();
+        ProcessNode.NodeRole role = node.role();
+        boolean isSource = role == ProcessNode.NodeRole.SOURCE;
+        boolean isSink = role == ProcessNode.NodeRole.SINK;
 
-        int headerBg = virtual ? Theme.NODE_VIRTUAL_HEADER_BG : Theme.NODE_HEADER_BG;
+        int headerBg = isSource ? 0xFF102A24
+                : (isSink ? 0xFF281838
+                : (virtual ? Theme.NODE_VIRTUAL_HEADER_BG : Theme.NODE_HEADER_BG));
+        int defaultBorder = isSource ? Theme.ACCENT_TEAL
+                : (isSink ? 0xFFA855F7
+                : (virtual ? Theme.NODE_VIRTUAL_BORDER
+                : (hovered ? 0xFF64748B : Theme.NODE_BORDER)));
         int border = selected ? Theme.NODE_SELECTED_BORDER
-                : (virtual ? Theme.NODE_VIRTUAL_BORDER : (hovered ? 0xFF64748B : Theme.NODE_BORDER));
+                : (activeSearch ? 0xFFFBBF24
+                : (inFlow ? 0xFF93C5FD : defaultBorder));
 
         // Shadow & body
         gfx.fill(x + 2, y + 3, x + w + 2, y + h + 3, 0x55000000);
@@ -390,6 +431,12 @@ public final class CanvasRenderer {
         }
         if (selected) {
             drawOutline(gfx, x - 1, y - 1, w + 2, h + 2, Theme.withAlpha(Theme.NODE_SELECTED_BORDER, 0x88));
+        } else if (activeSearch) {
+            drawOutline(gfx, x - 2, y - 2, w + 4, h + 4, 0xCCFBBF24);
+        } else if (searchMatch) {
+            drawOutline(gfx, x - 1, y - 1, w + 2, h + 2, 0x88F59E0B);
+        } else if (inFlow) {
+            drawOutline(gfx, x - 1, y - 1, w + 2, h + 2, 0x6693C5FD);
         }
 
         boolean drawText = ctx.viewport().zoom() >= 0.42;
@@ -405,11 +452,12 @@ public final class CanvasRenderer {
             drawOutline(gfx, bx, by, badgeW, 14, tier.badgeColor());
             gfx.drawString(font, tierName, bx + 4, by + 3, tier.badgeColor(), false);
 
-            // Title (with sandbox tag if virtual)
-            String prefix = virtual ? "[SIM] " : "";
+            // Title (with role/sandbox tag if virtual or SOURCE/SINK)
+            String prefix = isSource ? "[SRC] " : (isSink ? "[SINK] " : (virtual ? "[SIM] " : ""));
+            int titleColor = isSource ? 0xFF5EEAD4 : (isSink ? 0xFFD8B4FE : (virtual ? 0xFFFDE68A : Theme.TEXT_PRIMARY));
             int maxTitleW = Math.max(20, w - badgeW - 18);
             String title = font.plainSubstrByWidth(prefix + node.title(), maxTitleW);
-            gfx.drawString(font, title, x + 7, y + 9, virtual ? 0xFFFDE68A : Theme.TEXT_PRIMARY, false);
+            gfx.drawString(font, title, x + 7, y + 9, titleColor, false);
 
             // Metadata subtitle line
             String meta = formatMetaLine(node);
@@ -555,8 +603,20 @@ public final class CanvasRenderer {
         }
     }
 
-    private static void drawBezierWire(PoseStack pose, Vec2 start, Vec2 end, int argb, float halfWidth) {
-        List<Vec2> points = CanvasGeometry.sampleBezier(start, end, 24);
+    private static Vec2 wireMidpoint(List<Vec2> points, Vec2 fallbackStart, Vec2 fallbackEnd) {
+        if (points.size() < 2) {
+            return new Vec2((fallbackStart.x() + fallbackEnd.x()) * 0.5, (fallbackStart.y() + fallbackEnd.y()) * 0.5);
+        }
+        if (points.size() <= 6) {
+            int seg = (points.size() - 1) / 2;
+            Vec2 a = points.get(seg);
+            Vec2 b = points.get(seg + 1);
+            return new Vec2((a.x() + b.x()) * 0.5, (a.y() + b.y()) * 0.5);
+        }
+        return points.get(points.size() / 2);
+    }
+
+    private static void drawWire(PoseStack pose, List<Vec2> points, int argb, float halfWidth) {
         if (points.size() < 2) {
             return;
         }
@@ -594,11 +654,13 @@ public final class CanvasRenderer {
         }
         BufferUploader.drawWithShader(builder.end());
 
-        // Directional chevron at midpoint
-        Vec2 mid = points.get(points.size() / 2);
-        Vec2 midNext = points.get(Math.min(points.size() - 1, points.size() / 2 + 1));
-        double vx = midNext.x() - mid.x();
-        double vy = midNext.y() - mid.y();
+        // Directional chevron at midpoint of middle segment
+        int midSeg = (points.size() - 1) / 2;
+        Vec2 segA = points.get(midSeg);
+        Vec2 segB = points.get(midSeg + 1);
+        Vec2 mid = new Vec2((segA.x() + segB.x()) * 0.5, (segA.y() + segB.y()) * 0.5);
+        double vx = segB.x() - segA.x();
+        double vy = segB.y() - segA.y();
         double len = Math.hypot(vx, vy);
         if (len > 1e-6) {
             double ux = vx / len;

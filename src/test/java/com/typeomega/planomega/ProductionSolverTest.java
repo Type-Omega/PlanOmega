@@ -7,6 +7,7 @@ import com.typeomega.planomega.model.RecipeNode;
 import com.typeomega.planomega.model.ResourceKey;
 import com.typeomega.planomega.model.ResourcePort;
 import com.typeomega.planomega.model.VirtualRecipeNode;
+import com.typeomega.planomega.model.VoltageTier;
 import com.typeomega.planomega.solver.OverclockCalculator;
 import com.typeomega.planomega.solver.ProductionSolver;
 import com.typeomega.planomega.solver.SolveResult;
@@ -234,5 +235,60 @@ class ProductionSolverTest {
         assertEquals(16, solved.nodeStats().get("ebf").parallelCount());
         assertTrue(bomEntry.estimatedCoils() > 0);
         assertTrue(bomEntry.parallelHatches() > 0);
+    }
+
+    @Test
+    void computesTierAmperageAndEnergyHatchRecommendations() {
+        // EV tier (tier 4, 2048 EU/t): 1228.8 EU/t -> 0.6A per machine; 4 machines -> 2.4A EV -> 1x 4A Energy Hatch
+        RecipeNode evNode = new RecipeNode(
+                "ev_proc", 0, 0, 0, 0, null, "gtceu:chem/ev", "gtceu:chemical_reactor", null, "EV Reactor",
+                List.of(ResourcePort.input("in", ResourceKey.fluid("minecraft:water"), 1000)),
+                List.of(ResourcePort.output("out", ResourceKey.fluid("gtceu:hydrogen"), 1000)),
+                1228, 20, 4, null, 0, false, false, 1, 4000.0, "out", null
+        );
+        SolveResult res = ProductionSolver.solve(PlanGraph.empty("Amps Test").withNode(evNode));
+        assertTrue(res.isSolved());
+
+        SolveResult.NodeSolveStats stats = res.nodeStats().get("ev_proc");
+        double expectedAmps = (1228.0 * 4.0) / VoltageTier.EV.voltage();
+        assertEquals(expectedAmps, stats.amps(), 1e-4);
+        assertEquals(expectedAmps, res.tierAmperage().get(VoltageTier.EV), 1e-4);
+        assertEquals("1x 4A Energy Hatch", SolveResult.recommendEnergyHatch(2.4));
+        assertEquals("1x 16A Energy Hatch", SolveResult.recommendEnergyHatch(12.0));
+        assertTrue(SolveResult.formatTierAmperage(VoltageTier.EV, 2.4).contains("EV"));
+    }
+
+    @Test
+    void sourceAndSinkNodesDriveFlowAndAreExcludedFromMachinesAndEut() {
+        VirtualRecipeNode source = VirtualRecipeNode.createSource(
+                "src_water", 0, 0, "Water Source", ResourceKey.fluid("minecraft:water"), 1000.0);
+        RecipeNode processor = new RecipeNode(
+                "proc", 250, 0, 0, 0, null, "gtceu:electrolyzer/water", "gtceu:electrolyzer", null, "Electrolyzer",
+                List.of(ResourcePort.input("in_w", ResourceKey.fluid("minecraft:water"), 1000)),
+                List.of(ResourcePort.output("out_h2", ResourceKey.fluid("gtceu:hydrogen"), 2000)),
+                30, 20, 1, null, 0, false, false, 1, null, null, null
+        );
+        VirtualRecipeNode sink = VirtualRecipeNode.createSink(
+                "sink_h2", 500, 0, "Hydrogen Sink", ResourceKey.fluid("gtceu:hydrogen"), 1000.0, 4000.0);
+
+        PlanGraph graph = PlanGraph.empty("Source-Sink Test")
+                .withNode(source)
+                .withNode(processor)
+                .withNode(sink)
+                .withEdge(new PlanEdge("e1", "src_water", "out_0", "proc", "in_w", ResourceKey.fluid("minecraft:water"), true))
+                .withEdge(new PlanEdge("e2", "proc", "out_h2", "sink_h2", "in_0", ResourceKey.fluid("gtceu:hydrogen"), true));
+
+        SolveResult res = ProductionSolver.solve(graph);
+        assertTrue(res.isSolved());
+        // 4000 mB/s H2 target -> 2 crafts/s of Electrolyzer -> 2000 mB/s water from SOURCE
+        assertEquals(2.0, res.nodeStats().get("proc").craftsPerSecond(), 1e-4);
+        assertEquals(2000.0, res.edgeFlows().get("e1"), 1e-3);
+        assertEquals(4000.0, res.edgeFlows().get("e2"), 1e-3);
+        // SOURCE supplies all water so netImports for water is 0; SINK consumes all H2 so netExports is 0
+        assertFalse(res.netImports().containsKey(ResourceKey.fluid("minecraft:water")));
+        assertFalse(res.netExports().containsKey(ResourceKey.fluid("gtceu:hydrogen")));
+        // SOURCE and SINK are excluded from machine BOM and EU/t
+        assertEquals(1, res.machineBom().size());
+        assertEquals(60.0, res.totalConsumptionEut(), 1e-4);
     }
 }

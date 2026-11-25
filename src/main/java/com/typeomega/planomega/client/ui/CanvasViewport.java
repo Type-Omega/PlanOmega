@@ -97,6 +97,10 @@ public final class CanvasViewport {
         this.camY = camY;
     }
 
+    public void setZoom(double zoom) {
+        this.zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom));
+    }
+
     public void resetView() {
         camX = 0.0;
         camY = 0.0;

@@ -4,6 +4,7 @@ import com.typeomega.planomega.model.PlanEdge;
 import com.typeomega.planomega.model.PlanGraph;
 import com.typeomega.planomega.model.PlanNode;
 import com.typeomega.planomega.model.ProcessNode;
+import com.typeomega.planomega.model.ProcessNode.NodeRole;
 import com.typeomega.planomega.model.RecipeNode;
 import com.typeomega.planomega.model.ResourceKey;
 import com.typeomega.planomega.model.ResourceKind;
@@ -19,6 +20,7 @@ import org.ojalgo.optimisation.Optimisation;
 import org.ojalgo.optimisation.Variable;
 
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -86,10 +88,12 @@ public final class ProductionSolver {
             OverclockSpec spec = OverclockCalculator.compute(node);
             specs.put(node.id(), spec);
 
-            double euWeight = Math.max(0.0, spec.effectiveEut()) / Math.max(1.0, spec.craftsPerSecondPerMachine()) * 1e-4;
+            double rateWeight = node.isExternalIo()
+                    ? 1e-4
+                    : 0.05 + Math.max(0.0, spec.effectiveEut()) / Math.max(1.0, spec.craftsPerSecondPerMachine()) * 1e-4;
             Variable r = model.addVariable("rate_" + node.id())
                     .lower(0.0)
-                    .weight(0.05 + euWeight);
+                    .weight(rateWeight);
 
             if (node instanceof RecipeNode rec && rec.lockedRate() != null) {
                 r.level(Math.max(0.0, rec.lockedRate()));
@@ -239,6 +243,7 @@ public final class ProductionSolver {
         }
 
         Map<String, NodeSolveStats> nodeStats = new LinkedHashMap<>();
+        Map<VoltageTier, Double> tierAmperage = new EnumMap<>(VoltageTier.class);
         double totalConsumedEu = 0.0;
         double totalGeneratedEu = 0.0;
         int totalMachinesCeil = 0;
@@ -246,13 +251,34 @@ public final class ProductionSolver {
         for (ProcessNode node : processNodes) {
             double craftsPerSec = Math.max(0.0, result.get(model.indexOf(rateVars.get(node.id()))).doubleValue());
             OverclockSpec spec = specs.get(node.id());
+            if (node.isExternalIo()) {
+                nodeStats.put(node.id(), new NodeSolveStats(
+                        node.id(),
+                        craftsPerSec,
+                        0.0,
+                        0,
+                        0L,
+                        0.0,
+                        0.0,
+                        spec.effectiveTicks(),
+                        1,
+                        spec.machineTier(),
+                        1,
+                        0.0
+                ));
+                continue;
+            }
             double machinesExact = craftsPerSec / spec.craftsPerSecondPerMachine();
             int machinesCeil = machinesExact > EPS ? (int) Math.ceil(machinesExact - EPS) : 0;
             double totalEut = machinesExact * spec.effectiveEut();
             double peakEut = machinesCeil * (double) spec.effectiveEut();
+            double amps = NodeSolveStats.computeAmps(totalEut, spec.machineTier());
 
             if (totalEut >= 0) {
                 totalConsumedEu += totalEut;
+                if (amps > EPS) {
+                    tierAmperage.merge(VoltageTier.byIndex(spec.machineTier()), amps, Double::sum);
+                }
             } else {
                 totalGeneratedEu += -totalEut;
             }
@@ -269,7 +295,8 @@ public final class ProductionSolver {
                     spec.effectiveTicks(),
                     spec.subtickParallels(),
                     spec.machineTier(),
-                    spec.parallelCount()
+                    spec.parallelCount(),
+                    amps
             ));
         }
 
@@ -308,7 +335,8 @@ public final class ProductionSolver {
                 totalGeneratedEu,
                 totalMachinesCeil,
                 null,
-                machineBom
+                machineBom,
+                tierAmperage
         );
     }
 
@@ -333,6 +361,9 @@ public final class ProductionSolver {
 
         Map<BomKey, BomAcc> grouped = new LinkedHashMap<>();
         for (ProcessNode node : processNodes) {
+            if (node.isExternalIo()) {
+                continue;
+            }
             NodeSolveStats stat = nodeStats.get(node.id());
             if (stat == null || stat.machinesCeil() <= 0) {
                 continue;
@@ -538,6 +569,9 @@ public final class ProductionSolver {
     private static ResourcePort resolveTargetPort(ProcessNode node) {
         if (node.targetPortId() != null) {
             return node.findPort(node.targetPortId()).orElse(null);
+        }
+        if (node.role() == NodeRole.SINK) {
+            return node.inputs().isEmpty() ? null : node.inputs().get(0);
         }
         return node.outputs().isEmpty() ? null : node.outputs().get(0);
     }

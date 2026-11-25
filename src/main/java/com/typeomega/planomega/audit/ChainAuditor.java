@@ -6,6 +6,7 @@ import com.typeomega.planomega.model.PlanEdge;
 import com.typeomega.planomega.model.PlanGraph;
 import com.typeomega.planomega.model.PlanNode;
 import com.typeomega.planomega.model.ProcessNode;
+import com.typeomega.planomega.model.ProcessNode.NodeRole;
 import com.typeomega.planomega.model.ResourceKey;
 import com.typeomega.planomega.model.ResourceKind;
 import com.typeomega.planomega.model.ResourcePort;
@@ -50,12 +51,14 @@ public final class ChainAuditor {
             inDegree.merge(edge.toNodeId(), 1, Integer::sum);
         }
 
-        // Collect explicitly targeted outputs so intended final products are not flagged as orphan byproducts
+        // Collect explicitly targeted outputs (and SINK inputs) so intended final products are not flagged as orphan byproducts
         Set<ResourceKey> intendedTargetResources = new HashSet<>();
         for (ProcessNode proc : activeNodes) {
             if (proc.targetRate() != null && proc.targetRate() > 0.0) {
                 if (proc.targetPortId() != null) {
                     proc.findPort(proc.targetPortId()).ifPresent(p -> intendedTargetResources.add(p.resource()));
+                } else if (proc.role() == NodeRole.SINK && !proc.inputs().isEmpty()) {
+                    intendedTargetResources.add(proc.inputs().get(0).resource());
                 } else if (!proc.outputs().isEmpty()) {
                     intendedTargetResources.add(proc.outputs().get(0).resource());
                 }
@@ -69,6 +72,9 @@ public final class ChainAuditor {
 
         // 2. Structural & progression audits (redundant passthroughs, artificial direct jumps)
         for (ProcessNode proc : activeNodes) {
+            if (proc.isExternalIo()) {
+                continue;
+            }
             int ins = proc.inputs().size();
             int outs = proc.outputs().size();
 
@@ -155,6 +161,9 @@ public final class ChainAuditor {
         }
 
         for (ProcessNode proc : nodes) {
+            if (proc.isExternalIo()) {
+                continue;
+            }
             NodeSolveStats stats = solve.nodeStats().get(proc.id());
             if (stats == null || stats.craftsPerSecond() <= 1e-6) {
                 continue;
@@ -184,6 +193,9 @@ public final class ChainAuditor {
                         "Increase machine tier/overclock, enable parallels, or shorten recipe duration."
                 ));
             }
+
+            // Electrical amperage spike check (>4A warning, >16A critical)
+            auditElectricalSpikes(proc, stats, flags);
 
             // Hatch / Throughput Bottleneck check
             auditHatchThroughput(proc, stats, flags);
@@ -253,6 +265,9 @@ public final class ChainAuditor {
 
     private static String findProducerNode(List<ProcessNode> nodes, SolveResult solve, ResourceKey key) {
         for (ProcessNode proc : nodes) {
+            if (proc.isExternalIo()) {
+                continue;
+            }
             NodeSolveStats stats = solve.nodeStats().get(proc.id());
             if (stats == null || stats.craftsPerSecond() <= 1e-6) {
                 continue;
@@ -264,6 +279,41 @@ public final class ChainAuditor {
             }
         }
         return null;
+    }
+
+    private static void auditElectricalSpikes(
+            ProcessNode proc,
+            NodeSolveStats stats,
+            List<FrictionFlag> flags
+    ) {
+        double amps = stats.amps();
+        if (amps <= 4.0 + 1e-6) {
+            return;
+        }
+        String tierName = VoltageTier.byIndex(stats.machineTier()).shortName();
+        if (amps > 16.0 + 1e-6) {
+            flags.add(new FrictionFlag(
+                    Category.ELECTRICAL_SPIKE,
+                    Severity.CRITICAL,
+                    proc.id(),
+                    null,
+                    String.format("High amperage spike (%.1fA %s): %s", amps, tierName, proc.title()),
+                    String.format("Draws %.2fA at %s (%.0f EU/t), exceeding 16A energy hatch capacity.",
+                            amps, tierName, stats.totalEut()),
+                    "Upgrade machine tier, split into parallel lines, or use 16A/64A substation hatches."
+            ));
+        } else {
+            flags.add(new FrictionFlag(
+                    Category.ELECTRICAL_SPIKE,
+                    Severity.WARNING,
+                    proc.id(),
+                    null,
+                    String.format("Amperage spike (%.1fA %s): %s", amps, tierName, proc.title()),
+                    String.format("Draws %.2fA at %s (%.0f EU/t), exceeding standard 4A hatch capacity.",
+                            amps, tierName, stats.totalEut()),
+                    "Use a 4A/16A Energy Hatch, upgrade voltage tier, or distribute power across multiple hatches."
+            ));
+        }
     }
 
     private static void auditHatchThroughput(

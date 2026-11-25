@@ -1,9 +1,11 @@
 package com.typeomega.planomega.integration.emi;
 
 import com.typeomega.planomega.integration.IntegrationBridge.XeiLookup;
+import com.typeomega.planomega.integration.PendingRecipeQueue;
 import com.typeomega.planomega.model.PortDirection;
 import com.typeomega.planomega.model.ResourceKey;
 import com.typeomega.planomega.model.ResourcePort;
+import com.typeomega.planomega.recipe.RecipeCatalogManager;
 import com.typeomega.planomega.recipe.RecipeEntry;
 import dev.emi.emi.api.EmiApi;
 import dev.emi.emi.api.recipe.EmiRecipe;
@@ -54,7 +56,30 @@ public final class EmiLookupHelper {
         return key != null ? Optional.of(new XeiLookup(null, key, null)) : Optional.empty();
     }
 
-    private static @Nullable ResourceKey toResourceKey(@Nullable EmiIngredient ingredient) {
+    public static Optional<RecipeEntry> resolveOrConvert(@Nullable EmiRecipe recipe) {
+        if (recipe == null) {
+            return Optional.empty();
+        }
+        ResourceLocation id = recipe.getId();
+        if (id != null) {
+            Optional<RecipeEntry> catalogMatch = RecipeCatalogManager.get().findById(id.toString());
+            if (catalogMatch.isPresent()) {
+                return catalogMatch;
+            }
+        }
+        return Optional.ofNullable(convertEmiRecipe(recipe));
+    }
+
+    public static boolean enqueueRecipe(@Nullable EmiRecipe recipe) {
+        Optional<RecipeEntry> resolved = resolveOrConvert(recipe);
+        if (resolved.isPresent()) {
+            PendingRecipeQueue.enqueue(resolved.get());
+            return true;
+        }
+        return false;
+    }
+
+    public static @Nullable ResourceKey toResourceKey(@Nullable EmiIngredient ingredient) {
         if (ingredient == null || ingredient.isEmpty()) {
             return null;
         }
@@ -72,7 +97,7 @@ public final class EmiLookupHelper {
         return null;
     }
 
-    private static @Nullable RecipeEntry convertEmiRecipe(EmiRecipe recipe) {
+    public static @Nullable RecipeEntry convertEmiRecipe(EmiRecipe recipe) {
         ResourceLocation id = recipe.getId();
         if (id == null) {
             return null;

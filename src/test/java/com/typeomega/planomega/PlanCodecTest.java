@@ -1,11 +1,13 @@
 package com.typeomega.planomega;
 
 import com.typeomega.planomega.client.storage.PlanStorage;
+import com.typeomega.planomega.codec.BlueprintCodec;
 import com.typeomega.planomega.codec.DemoGraphFactory;
 import com.typeomega.planomega.codec.GroupTemplateCodec;
 import com.typeomega.planomega.codec.PlanCodec;
 import com.typeomega.planomega.model.GroupNode;
 import com.typeomega.planomega.model.PlanGraph;
+import com.typeomega.planomega.model.ProcessNode;
 import com.typeomega.planomega.model.RecipeNode;
 import com.typeomega.planomega.model.ResourceKey;
 import com.typeomega.planomega.model.ResourcePort;
@@ -141,5 +143,58 @@ class PlanCodecTest {
         GroupTemplateCodec.GroupTemplate loaded = PlanStorage.loadGroupTemplate(saved);
         assertEquals("Acid Core Template", loaded.name());
         assertTrue(PlanStorage.deleteGroupTemplate(saved));
+    }
+
+    @Test
+    void blueprintCodecGzipBase64RoundTripAndDetection() throws IOException {
+        PlanGraph original = DemoGraphFactory.createSampleSulfuricAcidPlan();
+        String bp = BlueprintCodec.encode(original);
+        assertTrue(bp.startsWith(BlueprintCodec.PREFIX));
+        assertTrue(BlueprintCodec.isBlueprint(bp));
+        assertTrue(BlueprintCodec.isBlueprint("  " + bp + "  "));
+        assertFalse(BlueprintCodec.isBlueprint(null));
+        assertFalse(BlueprintCodec.isBlueprint("{\"schemaVersion\":2}"));
+
+        PlanGraph decoded = BlueprintCodec.decode(bp);
+        assertEquals(original, decoded);
+    }
+
+    @Test
+    void sourceAndSinkRolesRoundTripAndPreserveSchemaCompatibility() {
+        VirtualRecipeNode source = VirtualRecipeNode.createSource(
+                "src_1", 10, 20, "Raw Sulfur", ResourceKey.item("gtceu:sulfur_dust"), 1.0);
+        VirtualRecipeNode sink = VirtualRecipeNode.createSink(
+                "sink_1", 400, 20, "Acid Target", ResourceKey.fluid("gtceu:sulfuric_acid"), 1000.0, 2000.0);
+
+        PlanGraph graph = PlanGraph.empty("Source/Sink Plan").withNode(source).withNode(sink);
+        String json = PlanCodec.toJson(graph);
+        PlanGraph decoded = PlanCodec.fromJson(json);
+
+        VirtualRecipeNode decodedSource = assertInstanceOf(VirtualRecipeNode.class, decoded.nodes().get("src_1"));
+        VirtualRecipeNode decodedSink = assertInstanceOf(VirtualRecipeNode.class, decoded.nodes().get("sink_1"));
+        assertEquals(ProcessNode.NodeRole.SOURCE, decodedSource.role());
+        assertEquals(ProcessNode.NodeRole.SINK, decodedSink.role());
+        assertEquals(2000.0, decodedSink.targetRate());
+
+        // Legacy virtual_recipe JSON without "role" defaults safely to PROCESS
+        String legacyVirtualJson = """
+                {
+                  "schemaVersion": 1,
+                  "name": "Legacy Virtual",
+                  "nodes": [
+                    {
+                      "type": "virtual_recipe",
+                      "id": "v_old",
+                      "title": "Old Sandbox",
+                      "inputs": [],
+                      "outputs": []
+                    }
+                  ],
+                  "edges": []
+                }
+                """;
+        PlanGraph legacy = PlanCodec.fromJson(legacyVirtualJson);
+        VirtualRecipeNode legacyNode = assertInstanceOf(VirtualRecipeNode.class, legacy.nodes().get("v_old"));
+        assertEquals(ProcessNode.NodeRole.PROCESS, legacyNode.role());
     }
 }

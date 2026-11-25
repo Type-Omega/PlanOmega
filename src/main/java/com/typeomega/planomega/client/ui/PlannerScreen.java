@@ -7,8 +7,10 @@ import com.typeomega.planomega.client.storage.PlanStorage;
 import com.typeomega.planomega.client.ui.CanvasGeometry.PortHit;
 import com.typeomega.planomega.client.ui.CanvasRenderer.MinimapBounds;
 import com.typeomega.planomega.client.ui.CanvasRenderer.RenderContext;
+import com.typeomega.planomega.codec.BlueprintCodec;
 import com.typeomega.planomega.codec.GroupTemplateCodec;
 import com.typeomega.planomega.integration.IntegrationBridge;
+import com.typeomega.planomega.integration.PendingRecipeQueue;
 import com.typeomega.planomega.integration.ae2.Ae2Bridge;
 import com.typeomega.planomega.model.GroupNode;
 import com.typeomega.planomega.model.PlanEdge;
@@ -31,6 +33,7 @@ import com.typeomega.planomega.solver.ProductionSolver;
 import com.typeomega.planomega.solver.SolveResult;
 import com.typeomega.planomega.solver.SolveResult.NodeSolveStats;
 import net.minecraft.ChatFormatting;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
@@ -54,14 +57,23 @@ public final class PlannerScreen extends Screen {
 
     private static final int TOOLBAR_SINGLE_HEIGHT = 30;
     private static final int TOOLBAR_DOUBLE_HEIGHT = 54;
+    private static final int TAB_BAR_HEIGHT = 22;
     private static final int STATUS_HEIGHT = 20;
     private static final DecimalFormat TOOLTIP_FMT = new DecimalFormat("#.##");
 
     private final CanvasViewport viewport = new CanvasViewport();
-    private final UndoHistory history = new UndoHistory(64);
     private final SummaryDrawer summaryDrawer = new SummaryDrawer();
     private final List<ToolbarButton> toolbarButtons = new ArrayList<>();
-    private final Set<String> selectedNodeIds = new LinkedHashSet<>();
+    private final List<PlanTab> openTabs = new ArrayList<>();
+    private final List<TabRect> tabRects = new ArrayList<>();
+    private int activeTabIndex = 0;
+    private int newTabBtnX = 0;
+    private int newTabBtnY = 0;
+    private int newTabBtnW = 0;
+    private int newTabBtnH = 0;
+
+    private UndoHistory history = new UndoHistory(64);
+    private Set<String> selectedNodeIds = new LinkedHashSet<>();
 
     private int toolbarHeight = TOOLBAR_SINGLE_HEIGHT;
     private boolean showToolbarTitle = true;
@@ -72,7 +84,16 @@ public final class PlannerScreen extends Screen {
     private @Nullable String selectedEdgeId;
     private boolean showGrid = true;
     private boolean snapToGrid = true;
+    private boolean orthogonalRouting = false;
     private boolean summaryOpen = true;
+
+    // Floating Quick Search (Ctrl+F)
+    private boolean searchOpen = false;
+    private String searchQuery = "";
+    private int searchSelectedIndex = 0;
+    private List<SearchResultItem> searchResults = List.of();
+    private Set<String> searchMatchedNodeIds = Set.of();
+    private @Nullable String activeSearchNodeId = null;
 
     // Interaction state
     private boolean panning = false;
@@ -104,7 +125,13 @@ public final class PlannerScreen extends Screen {
 
     public PlannerScreen() {
         super(Component.translatable("planomega.title"));
-        this.graph = PlanStorage.loadAutosaveOrDefault();
+        PlanGraph initial = PlanStorage.loadAutosaveOrDefault();
+        PlanTab firstTab = new PlanTab(initial);
+        openTabs.add(firstTab);
+        activeTabIndex = 0;
+        this.graph = initial;
+        this.history = firstTab.history;
+        this.selectedNodeIds = firstTab.selectedNodeIds;
         recomputeAnalysis();
     }
 
@@ -124,6 +151,7 @@ public final class PlannerScreen extends Screen {
             fitGraphToView();
             initialFitDone = true;
         }
+        consumePendingXeiQueue();
     }
 
     @Override
@@ -135,6 +163,7 @@ public final class PlannerScreen extends Screen {
                 activeModal = null;
             }
         }
+        consumePendingXeiQueue();
     }
 
     @Override
@@ -171,7 +200,8 @@ public final class PlannerScreen extends Screen {
                 }),
                 new ButtonSpec(Theme.ICON_FIT, "planomega.toolbar.fit", "F", Theme.BTN_BORDER, false, this::fitGraphToView),
                 new ButtonSpec(Theme.ICON_LAYOUT, "planomega.toolbar.layout", "L", Theme.ACCENT_TEAL, false, this::performAutoLayout),
-                new ButtonSpec(Theme.ICON_LAYOUT, "planomega.toolbar.auto_connect", "", Theme.ACCENT_TEAL, false, () -> performAutoConnect(false))
+                new ButtonSpec(Theme.ICON_LAYOUT, "planomega.toolbar.auto_connect", "", Theme.ACCENT_TEAL, false, () -> performAutoConnect(false)),
+                new ButtonSpec(Theme.ICON_GRID, "planomega.toolbar.routing", "O", Theme.ACCENT_TEAL, orthogonalRouting, this::toggleRoutingMode)
         );
 
         List<ButtonSpec> rightSpecs = List.of(
@@ -252,8 +282,9 @@ public final class PlannerScreen extends Screen {
     }
 
     private void updateViewportBounds() {
+        int topOffset = toolbarHeight + TAB_BAR_HEIGHT;
         int canvasW = summaryOpen ? Math.max(200, this.width - SummaryDrawer.WIDTH) : this.width;
-        viewport.setBounds(0, toolbarHeight, canvasW, Math.max(1, this.height - toolbarHeight - STATUS_HEIGHT));
+        viewport.setBounds(0, topOffset, canvasW, Math.max(1, this.height - topOffset - STATUS_HEIGHT));
     }
 
     @Override
@@ -265,7 +296,8 @@ public final class PlannerScreen extends Screen {
 
         MinimapBounds minimap = CanvasRenderer.computeMinimapBounds(graph, viewport);
         boolean overMinimap = minimap != null && minimap.contains(mouseX, mouseY);
-        boolean canHoverCanvas = activeModal == null && activeContextMenu == null && !overMinimap && viewport.isPointInside(mouseX, mouseY);
+        boolean overSearch = searchOpen && isMouseOverSearchOverlay(mouseX, mouseY);
+        boolean canHoverCanvas = activeModal == null && activeContextMenu == null && !overMinimap && !overSearch && viewport.isPointInside(mouseX, mouseY);
 
         ProcessNode hoveredAuditNode = canHoverCanvas
                 ? CanvasGeometry.findAuditBadgeNodeAt(graph, auditReport, this.font, mwx, mwy) : null;
@@ -274,7 +306,7 @@ public final class PlannerScreen extends Screen {
         PlanNode hoveredNode = (canHoverCanvas && hoveredAuditNode == null && hoveredPort == null)
                 ? CanvasGeometry.findNodeAt(graph, mwx, mwy) : null;
         PlanEdge hoveredEdge = (canHoverCanvas && hoveredAuditNode == null && hoveredPort == null && hoveredNode == null)
-                ? CanvasGeometry.findEdgeAt(graph, mwx, mwy) : null;
+                ? CanvasGeometry.findEdgeAt(graph, mwx, mwy, orthogonalRouting) : null;
 
         double[] marquee = drawingMarquee ? new double[]{marqueeStartWx, marqueeStartWy, mwx, mwy} : null;
 
@@ -290,20 +322,28 @@ public final class PlannerScreen extends Screen {
                 mwx,
                 mwy,
                 showGrid,
+                orthogonalRouting,
                 marquee,
                 solveResult,
-                auditReport
+                auditReport,
+                searchOpen ? searchMatchedNodeIds : Set.of(),
+                searchOpen ? activeSearchNodeId : null
         ));
 
         if (summaryOpen) {
+            int topOffset = toolbarHeight + TAB_BAR_HEIGHT;
             summaryDrawer.render(gfx, this.font, graph, solveResult, auditReport,
-                    viewport.viewWidth(), toolbarHeight,
-                    this.height - toolbarHeight - STATUS_HEIGHT,
+                    viewport.viewWidth(), topOffset,
+                    this.height - topOffset - STATUS_HEIGHT,
                     mouseX, mouseY);
         }
 
         renderToolbar(gfx, mouseX, mouseY);
+        renderTabBar(gfx, mouseX, mouseY);
         renderStatusBar(gfx, mwx, mwy);
+        if (searchOpen) {
+            renderSearchOverlay(gfx, mouseX, mouseY);
+        }
         renderToast(gfx);
 
         if (activeContextMenu != null) {
@@ -358,7 +398,7 @@ public final class PlannerScreen extends Screen {
         }
         int tw = this.font.width(toastText) + 20;
         int x = (this.width - tw) / 2;
-        int y = toolbarHeight + 10;
+        int y = toolbarHeight + TAB_BAR_HEIGHT + (searchOpen ? 36 : 10);
         gfx.fill(x, y, x + tw, y + 20, 0xEE102A2E);
         gfx.fill(x, y, x + tw, y + 1, Theme.ACCENT_TEAL);
         gfx.fill(x, y + 19, x + tw, y + 20, Theme.ACCENT_TEAL);
@@ -500,7 +540,23 @@ public final class PlannerScreen extends Screen {
             return true;
         }
 
-        if (summaryOpen && mouseX >= viewport.viewWidth() && mouseY >= toolbarHeight && mouseY < this.height - STATUS_HEIGHT) {
+        // Tab bar click
+        if (button == 0 && mouseY >= toolbarHeight && mouseY < toolbarHeight + TAB_BAR_HEIGHT) {
+            if (handleTabBarClick(mouseX, mouseY)) {
+                return true;
+            }
+            return true;
+        }
+
+        // Floating search overlay click
+        if (searchOpen) {
+            if (handleSearchOverlayClick(mouseX, mouseY, button)) {
+                return true;
+            }
+        }
+
+        int topOffset = toolbarHeight + TAB_BAR_HEIGHT;
+        if (summaryOpen && mouseX >= viewport.viewWidth() && mouseY >= topOffset && mouseY < this.height - STATUS_HEIGHT) {
             summaryDrawer.mouseClicked(mouseX, mouseY, button, this::focusNode);
             return true;
         }
@@ -588,7 +644,7 @@ public final class PlannerScreen extends Screen {
         }
 
         // 3. Edge hit
-        PlanEdge edgeHit = CanvasGeometry.findEdgeAt(graph, wx, wy);
+        PlanEdge edgeHit = CanvasGeometry.findEdgeAt(graph, wx, wy, orthogonalRouting);
         if (edgeHit != null) {
             selectedNodeIds.clear();
             selectedEdgeId = edgeHit.id();
@@ -750,6 +806,63 @@ public final class PlannerScreen extends Screen {
         }
 
         boolean ctrl = hasControlDown();
+        if (searchOpen) {
+            if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
+                closeSearch();
+                return true;
+            }
+            if (keyCode == GLFW.GLFW_KEY_ENTER || keyCode == GLFW.GLFW_KEY_KP_ENTER) {
+                if (!searchResults.isEmpty()) {
+                    jumpToSearchResult(searchSelectedIndex, true);
+                }
+                return true;
+            }
+            if (keyCode == GLFW.GLFW_KEY_UP && !searchResults.isEmpty()) {
+                searchSelectedIndex = (searchSelectedIndex - 1 + searchResults.size()) % searchResults.size();
+                activeSearchNodeId = searchResults.get(searchSelectedIndex).nodeId();
+                return true;
+            }
+            if (keyCode == GLFW.GLFW_KEY_DOWN && !searchResults.isEmpty()) {
+                searchSelectedIndex = (searchSelectedIndex + 1) % searchResults.size();
+                activeSearchNodeId = searchResults.get(searchSelectedIndex).nodeId();
+                return true;
+            }
+            if (keyCode == GLFW.GLFW_KEY_BACKSPACE) {
+                if (ctrl) {
+                    searchQuery = "";
+                } else if (!searchQuery.isEmpty()) {
+                    searchQuery = searchQuery.substring(0, searchQuery.length() - 1);
+                }
+                refreshSearchResults();
+                return true;
+            }
+            if (ctrl && keyCode == GLFW.GLFW_KEY_F) {
+                return true;
+            }
+            return true;
+        }
+
+        if (ctrl && keyCode == GLFW.GLFW_KEY_F) {
+            openSearch();
+            return true;
+        }
+        if (ctrl && keyCode == GLFW.GLFW_KEY_N) {
+            openNewTab();
+            return true;
+        }
+        if (ctrl && keyCode == GLFW.GLFW_KEY_W) {
+            if (openTabs.size() > 1) {
+                closeTab(activeTabIndex);
+            }
+            return true;
+        }
+        if (ctrl && keyCode == GLFW.GLFW_KEY_TAB && openTabs.size() > 1) {
+            int next = hasShiftDown()
+                    ? (activeTabIndex - 1 + openTabs.size()) % openTabs.size()
+                    : (activeTabIndex + 1) % openTabs.size();
+            switchToTab(next);
+            return true;
+        }
         if (ctrl && keyCode == GLFW.GLFW_KEY_Z) {
             if (hasShiftDown()) {
                 performRedo();
@@ -775,24 +888,41 @@ public final class PlannerScreen extends Screen {
             groupSelected();
             return true;
         }
+        if (ctrl && hasShiftDown() && keyCode == GLFW.GLFW_KEY_C) {
+            copyBlueprintToClipboard();
+            return true;
+        }
+        if (ctrl && hasShiftDown() && keyCode == GLFW.GLFW_KEY_V) {
+            pasteBlueprintFromClipboard();
+            return true;
+        }
         if (ctrl && keyCode == GLFW.GLFW_KEY_C) {
             copySelection();
             return true;
         }
         if (ctrl && keyCode == GLFW.GLFW_KEY_V) {
-            pasteSelection();
+            String clip = Minecraft.getInstance().keyboardHandler.getClipboard();
+            if ((copiedSubgraph == null || copiedSubgraph.nodes().isEmpty()) && BlueprintCodec.isBlueprint(clip)) {
+                pasteBlueprintFromClipboard();
+            } else {
+                pasteSelection();
+            }
             return true;
         }
         if (keyCode == GLFW.GLFW_KEY_DELETE || keyCode == GLFW.GLFW_KEY_BACKSPACE) {
             deleteSelection();
             return true;
         }
-        if (keyCode == GLFW.GLFW_KEY_F) {
+        if (keyCode == GLFW.GLFW_KEY_F && !ctrl) {
             fitGraphToView();
             return true;
         }
         if (keyCode == GLFW.GLFW_KEY_L && !ctrl) {
             performAutoLayout();
+            return true;
+        }
+        if (keyCode == GLFW.GLFW_KEY_O && !ctrl) {
+            toggleRoutingMode();
             return true;
         }
         if (keyCode == GLFW.GLFW_KEY_R && !ctrl) {
@@ -807,7 +937,7 @@ public final class PlannerScreen extends Screen {
             openExportModal();
             return true;
         }
-        if (keyCode == GLFW.GLFW_KEY_TAB) {
+        if (keyCode == GLFW.GLFW_KEY_TAB && !ctrl) {
             summaryOpen = !summaryOpen;
             updateViewportBounds();
             rebuildToolbarButtons();
@@ -826,6 +956,13 @@ public final class PlannerScreen extends Screen {
     public boolean charTyped(char codePoint, int modifiers) {
         if (activeModal != null) {
             return activeModal.charTyped(codePoint, modifiers);
+        }
+        if (searchOpen) {
+            if (codePoint >= 32 && !hasControlDown()) {
+                searchQuery += codePoint;
+                refreshSearchResults();
+            }
+            return true;
         }
         return super.charTyped(codePoint, modifiers);
     }
@@ -1052,15 +1189,7 @@ public final class PlannerScreen extends Screen {
     private void openPlansModal() {
         openModal(new PlannerModal.PlansManagerModal(
                 graph,
-                loaded -> {
-                    history.recordBeforeEdit(graph);
-                    graph = loaded;
-                    recomputeAnalysis();
-                    selectedNodeIds.clear();
-                    selectedEdgeId = null;
-                    PlanStorage.saveAutosave(graph);
-                    fitGraphToView();
-                },
+                loaded -> openGraphInTab(loaded),
                 this::showToast
         ));
     }
@@ -1239,11 +1368,21 @@ public final class PlannerScreen extends Screen {
                         Theme.ACCENT_TEAL,
                         () -> openRecipeSearchForPort(portHit)
                 ));
+                items.add(new ContextMenuItem(
+                        Component.translatable("planomega.ctx.add_source").getString(),
+                        Theme.ACCENT_TEAL,
+                        () -> createSourceForPort(portHit)
+                ));
             } else {
                 items.add(new ContextMenuItem(
                         Component.translatable("planomega.ctx.generate_consumer").getString(),
                         Theme.ACCENT_TEAL,
                         () -> openRecipeSearchForPort(portHit)
+                ));
+                items.add(new ContextMenuItem(
+                        Component.translatable("planomega.ctx.add_sink").getString(),
+                        0xFFA855F7,
+                        () -> createSinkForPort(portHit)
                 ));
             }
             if (connected) {
@@ -1276,6 +1415,11 @@ public final class PlannerScreen extends Screen {
                         ))
                 ));
                 if (proc instanceof RecipeNode recipe) {
+                    items.add(new ContextMenuItem(
+                            Component.translatable("planomega.ctx.switch_recipe").getString(),
+                            Theme.ACCENT_TEAL,
+                            () -> openRecipeSwitcher(recipe)
+                    ));
                     items.add(new ContextMenuItem(
                             Component.translatable("planomega.ctx.clone_sandbox").getString(),
                             Theme.ACCENT_AMBER,
@@ -1368,10 +1512,15 @@ public final class PlannerScreen extends Screen {
                 ));
             }
         } else {
-            PlanEdge edgeHit = CanvasGeometry.findEdgeAt(graph, wx, wy);
+            PlanEdge edgeHit = CanvasGeometry.findEdgeAt(graph, wx, wy, orthogonalRouting);
             if (edgeHit != null) {
                 selectedNodeIds.clear();
                 selectedEdgeId = edgeHit.id();
+                items.add(new ContextMenuItem(
+                        Component.translatable("planomega.ctx.toggle_routing").getString(),
+                        Theme.ACCENT_TEAL,
+                        this::toggleRoutingMode
+                ));
                 items.add(new ContextMenuItem(
                         Component.translatable("planomega.ctx.delete_edge").getString(),
                         0xFFEF4444,
@@ -1405,10 +1554,27 @@ public final class PlannerScreen extends Screen {
                         () -> createVirtualNodeAt(placeX, placeY)
                 ));
                 items.add(new ContextMenuItem(
+                        Component.translatable("planomega.ctx.add_source").getString(),
+                        Theme.ACCENT_TEAL,
+                        () -> createSourceNodeAt(placeX, placeY)
+                ));
+                items.add(new ContextMenuItem(
+                        Component.translatable("planomega.ctx.add_sink").getString(),
+                        0xFFA855F7,
+                        () -> createSinkNodeAt(placeX, placeY)
+                ));
+                items.add(new ContextMenuItem(
                         Component.translatable("planomega.ctx.insert_template").getString(),
                         Theme.ACCENT_TEAL,
                         () -> openTemplatesModalAt(placeX, placeY)
                 ));
+                if (IntegrationBridge.hasActiveEmiTree()) {
+                    items.add(new ContextMenuItem(
+                            Component.translatable("planomega.ctx.import_emi_tree").getString(),
+                            Theme.ACCENT_TEAL,
+                            this::importActiveEmiTree
+                    ));
+                }
                 if (copiedSubgraph != null && !copiedSubgraph.nodes().isEmpty()) {
                     items.add(new ContextMenuItem(
                             Component.translatable("planomega.ctx.paste").getString(),
@@ -1416,6 +1582,24 @@ public final class PlannerScreen extends Screen {
                             this::pasteSelection
                     ));
                 }
+                items.add(new ContextMenuItem(
+                        Component.translatable("planomega.ctx.copy_blueprint").getString(),
+                        Theme.TEXT_PRIMARY,
+                        this::copyBlueprintToClipboard
+                ));
+                String clip = Minecraft.getInstance().keyboardHandler.getClipboard();
+                if (BlueprintCodec.isBlueprint(clip)) {
+                    items.add(new ContextMenuItem(
+                            Component.translatable("planomega.ctx.paste_blueprint").getString(),
+                            Theme.ACCENT_TEAL,
+                            this::pasteBlueprintFromClipboard
+                    ));
+                }
+                items.add(new ContextMenuItem(
+                        Component.translatable("planomega.ctx.toggle_routing").getString(),
+                        Theme.TEXT_SECONDARY,
+                        this::toggleRoutingMode
+                ));
                 items.add(new ContextMenuItem(
                         Component.translatable("planomega.ctx.auto_connect").getString(),
                         Theme.ACCENT_TEAL,
@@ -1634,5 +1818,641 @@ public final class PlannerScreen extends Screen {
                 gfx.drawString(font, label, iconX + iconSize + 4, y + (h - 8) / 2, Theme.TEXT_PRIMARY, false);
             }
         }
+    }
+
+    private void toggleRoutingMode() {
+        orthogonalRouting = !orthogonalRouting;
+        rebuildToolbarButtons();
+        showToast(Component.translatable(orthogonalRouting
+                ? "planomega.toast.routing_orthogonal"
+                : "planomega.toast.routing_bezier").getString());
+    }
+
+    // ==================== Plan Tabs ====================
+
+    private void syncActiveTabState() {
+        if (activeTabIndex < 0 || activeTabIndex >= openTabs.size()) {
+            return;
+        }
+        PlanTab tab = openTabs.get(activeTabIndex);
+        tab.graph = this.graph;
+        tab.selectedEdgeId = this.selectedEdgeId;
+        tab.solveResult = this.solveResult;
+        tab.auditReport = this.auditReport;
+        tab.camX = viewport.camX();
+        tab.camY = viewport.camY();
+        tab.zoom = viewport.zoom();
+        tab.initialFitDone = this.initialFitDone;
+    }
+
+    private void switchToTab(int idx) {
+        if (idx < 0 || idx >= openTabs.size() || idx == activeTabIndex) {
+            return;
+        }
+        syncActiveTabState();
+        activeTabIndex = idx;
+        PlanTab tab = openTabs.get(idx);
+        this.graph = tab.graph;
+        this.history = tab.history;
+        this.selectedNodeIds = tab.selectedNodeIds;
+        this.selectedEdgeId = tab.selectedEdgeId;
+        this.solveResult = tab.solveResult;
+        this.auditReport = tab.auditReport;
+        this.initialFitDone = tab.initialFitDone;
+        if (this.solveResult == null || this.auditReport == null) {
+            recomputeAnalysis();
+        }
+        viewport.setCamera(tab.camX, tab.camY);
+        viewport.setZoom(tab.zoom);
+        if (!this.initialFitDone) {
+            fitGraphToView();
+            this.initialFitDone = true;
+        }
+        if (searchOpen) {
+            refreshSearchResults();
+        }
+    }
+
+    private void openNewTab() {
+        PlanGraph empty = PlanGraph.empty("Plan " + (openTabs.size() + 1));
+        openGraphInTab(empty);
+    }
+
+    private void openGraphInTab(PlanGraph loaded) {
+        for (int i = 0; i < openTabs.size(); i++) {
+            if (openTabs.get(i).graph.id().equals(loaded.id())) {
+                switchToTab(i);
+                history.recordBeforeEdit(graph);
+                graph = loaded;
+                recomputeAnalysis();
+                selectedNodeIds.clear();
+                selectedEdgeId = null;
+                PlanStorage.saveAutosave(graph);
+                fitGraphToView();
+                return;
+            }
+        }
+        if (graph.nodes().isEmpty() && graph.edges().isEmpty()) {
+            history.recordBeforeEdit(graph);
+            graph = loaded;
+            recomputeAnalysis();
+            selectedNodeIds.clear();
+            selectedEdgeId = null;
+            PlanStorage.saveAutosave(graph);
+            fitGraphToView();
+            return;
+        }
+        syncActiveTabState();
+        PlanTab tab = new PlanTab(loaded);
+        openTabs.add(tab);
+        activeTabIndex = openTabs.size() - 1;
+        this.graph = loaded;
+        this.history = tab.history;
+        this.selectedNodeIds = tab.selectedNodeIds;
+        this.selectedEdgeId = null;
+        recomputeAnalysis();
+        fitGraphToView();
+        this.initialFitDone = true;
+        PlanStorage.saveAutosave(graph);
+    }
+
+    private void closeTab(int idx) {
+        if (idx < 0 || idx >= openTabs.size()) {
+            return;
+        }
+        if (openTabs.size() == 1) {
+            PlanGraph empty = PlanGraph.empty("Untitled Plan");
+            openTabs.set(0, new PlanTab(empty));
+            activeTabIndex = 0;
+            PlanTab tab = openTabs.get(0);
+            this.graph = tab.graph;
+            this.history = tab.history;
+            this.selectedNodeIds = tab.selectedNodeIds;
+            this.selectedEdgeId = null;
+            recomputeAnalysis();
+            viewport.resetView();
+            return;
+        }
+        openTabs.remove(idx);
+        if (activeTabIndex >= openTabs.size()) {
+            activeTabIndex = openTabs.size() - 1;
+        } else if (idx < activeTabIndex) {
+            activeTabIndex--;
+        }
+        PlanTab tab = openTabs.get(activeTabIndex);
+        this.graph = tab.graph;
+        this.history = tab.history;
+        this.selectedNodeIds = tab.selectedNodeIds;
+        this.selectedEdgeId = tab.selectedEdgeId;
+        this.solveResult = tab.solveResult;
+        this.auditReport = tab.auditReport;
+        this.initialFitDone = tab.initialFitDone;
+        if (this.solveResult == null || this.auditReport == null) {
+            recomputeAnalysis();
+        }
+        viewport.setCamera(tab.camX, tab.camY);
+        viewport.setZoom(tab.zoom);
+        if (searchOpen) {
+            refreshSearchResults();
+        }
+    }
+
+    private void renderTabBar(GuiGraphics gfx, int mouseX, int mouseY) {
+        int y = toolbarHeight;
+        int h = TAB_BAR_HEIGHT;
+        gfx.fill(0, y, this.width, y + h, 0xEE0B1017);
+        gfx.fill(0, y + h - 1, this.width, y + h, Theme.BAR_BORDER);
+
+        tabRects.clear();
+        int curX = 6;
+        int maxTabArea = this.width - 36;
+        int maxTabW = openTabs.isEmpty() ? 140 : Math.max(72, Math.min(150, (maxTabArea - 12) / Math.max(1, openTabs.size())));
+
+        for (int i = 0; i < openTabs.size(); i++) {
+            PlanTab tab = openTabs.get(i);
+            String title = (i == activeTabIndex ? this.graph.name() : tab.graph.name());
+            int desiredW = Math.min(maxTabW, Math.max(72, this.font.width(title) + 30));
+            if (curX + desiredW > maxTabArea) {
+                break;
+            }
+            boolean active = (i == activeTabIndex);
+            boolean hovered = mouseX >= curX && mouseX <= curX + desiredW && mouseY >= y + 2 && mouseY < y + h;
+            int bg = active ? Theme.CANVAS_BG : (hovered ? Theme.BTN_HOVER : Theme.BTN_BG);
+            gfx.fill(curX, y + 2, curX + desiredW, y + h - (active ? 0 : 1), bg);
+            if (active) {
+                gfx.fill(curX, y + 2, curX + desiredW, y + 4, Theme.ACCENT_TEAL);
+            } else {
+                gfx.fill(curX, y + 2, curX + desiredW, y + 3, Theme.BAR_BORDER);
+            }
+            gfx.fill(curX, y + 2, curX + 1, y + h, Theme.BAR_BORDER);
+            gfx.fill(curX + desiredW - 1, y + 2, curX + desiredW, y + h, Theme.BAR_BORDER);
+
+            String clipped = this.font.plainSubstrByWidth(title, desiredW - 24);
+            gfx.drawString(this.font, clipped, curX + 6, y + 7, active ? Theme.TEXT_PRIMARY : Theme.TEXT_SECONDARY, false);
+
+            int closeW = 12;
+            int closeX = curX + desiredW - closeW - 3;
+            boolean closeHover = mouseX >= closeX && mouseX <= closeX + closeW && mouseY >= y + 4 && mouseY <= y + h - 3;
+            gfx.drawString(this.font, "x", closeX + 3, y + 7, closeHover ? 0xFFEF4444 : Theme.TEXT_MUTED, false);
+
+            tabRects.add(new TabRect(curX, y + 2, desiredW, h - 2, closeX, closeW, i));
+            curX += desiredW + 3;
+        }
+
+        newTabBtnX = curX + 2;
+        newTabBtnY = y + 3;
+        newTabBtnW = 18;
+        newTabBtnH = h - 6;
+        boolean plusHover = mouseX >= newTabBtnX && mouseX <= newTabBtnX + newTabBtnW
+                && mouseY >= newTabBtnY && mouseY <= newTabBtnY + newTabBtnH;
+        gfx.fill(newTabBtnX, newTabBtnY, newTabBtnX + newTabBtnW, newTabBtnY + newTabBtnH, plusHover ? Theme.BTN_HOVER : Theme.BTN_BG);
+        gfx.drawString(this.font, "+", newTabBtnX + 6, newTabBtnY + 4, plusHover ? Theme.ACCENT_TEAL : Theme.TEXT_SECONDARY, false);
+    }
+
+    private boolean handleTabBarClick(double mouseX, double mouseY) {
+        if (mouseX >= newTabBtnX && mouseX <= newTabBtnX + newTabBtnW
+                && mouseY >= newTabBtnY && mouseY <= newTabBtnY + newTabBtnH) {
+            openNewTab();
+            return true;
+        }
+        for (TabRect rect : tabRects) {
+            if (mouseX >= rect.x() && mouseX <= rect.x() + rect.w()
+                    && mouseY >= rect.y() && mouseY <= rect.y() + rect.h()) {
+                if (mouseX >= rect.closeX() && mouseX <= rect.closeX() + rect.closeW()) {
+                    closeTab(rect.index());
+                } else {
+                    switchToTab(rect.index());
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ==================== Floating Quick Search (Ctrl+F) ====================
+
+    private void openSearch() {
+        searchOpen = true;
+        searchQuery = "";
+        searchSelectedIndex = 0;
+        refreshSearchResults();
+    }
+
+    private void closeSearch() {
+        searchOpen = false;
+        searchResults = List.of();
+        searchMatchedNodeIds = Set.of();
+        activeSearchNodeId = null;
+    }
+
+    private void refreshSearchResults() {
+        String q = searchQuery.trim().toLowerCase(java.util.Locale.ROOT);
+        String[] tokens = q.isEmpty() ? new String[0] : q.split("\\s+");
+
+        List<SearchResultItem> matches = new ArrayList<>();
+        Set<String> matchedIds = new LinkedHashSet<>();
+
+        for (PlanNode node : graph.nodes().values()) {
+            String title;
+            String subtitle;
+            int badgeColor;
+            StringBuilder haystack = new StringBuilder();
+            haystack.append(node.id()).append(' ');
+
+            if (node instanceof ProcessNode proc) {
+                title = proc.title();
+                VoltageTier vt = VoltageTier.byIndex(proc.tier());
+                subtitle = vt.shortName() + " • " + proc.machineId();
+                badgeColor = vt.badgeColor();
+                haystack.append(proc.title()).append(' ')
+                        .append(proc.machineId()).append(' ')
+                        .append(proc.recipeTypeId()).append(' ')
+                        .append(vt.shortName()).append(' ')
+                        .append(proc.role().name()).append(' ');
+                if (proc instanceof RecipeNode r) {
+                    haystack.append(r.recipeId()).append(' ');
+                } else if (proc instanceof VirtualRecipeNode v) {
+                    haystack.append(v.baseRecipeId()).append(' ').append(v.notes()).append(' ');
+                }
+                for (ResourcePort p : proc.inputs()) {
+                    haystack.append(p.displayLabel()).append(' ').append(p.resource().id()).append(' ');
+                }
+                for (ResourcePort p : proc.outputs()) {
+                    haystack.append(p.displayLabel()).append(' ').append(p.resource().id()).append(' ');
+                }
+            } else if (node instanceof GroupNode group) {
+                title = group.title();
+                subtitle = "Group (" + group.childNodeIds().size() + ")";
+                badgeColor = group.color();
+                haystack.append(group.title()).append(" group ");
+            } else if (node instanceof StickyNoteNode note) {
+                title = note.title().isBlank() ? "Note" : note.title();
+                subtitle = note.text();
+                badgeColor = note.color();
+                haystack.append(note.title()).append(' ').append(note.text()).append(" note ");
+            } else {
+                continue;
+            }
+
+            String hay = haystack.toString().toLowerCase(java.util.Locale.ROOT);
+            boolean ok = true;
+            for (String tok : tokens) {
+                if (!hay.contains(tok)) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) {
+                matches.add(new SearchResultItem(node.id(), title, subtitle, badgeColor));
+                matchedIds.add(node.id());
+            }
+        }
+
+        this.searchResults = matches;
+        this.searchMatchedNodeIds = matchedIds;
+        if (matches.isEmpty()) {
+            this.searchSelectedIndex = 0;
+            this.activeSearchNodeId = null;
+        } else {
+            this.searchSelectedIndex = Math.max(0, Math.min(this.searchSelectedIndex, matches.size() - 1));
+            this.activeSearchNodeId = matches.get(this.searchSelectedIndex).nodeId();
+        }
+    }
+
+    private void jumpToSearchResult(int idx, boolean closeAfter) {
+        if (idx < 0 || idx >= searchResults.size()) {
+            return;
+        }
+        String nodeId = searchResults.get(idx).nodeId();
+        expandAncestors(nodeId);
+        focusNode(nodeId);
+        if (closeAfter) {
+            closeSearch();
+        }
+    }
+
+    private void expandAncestors(String nodeId) {
+        PlanNode cur = graph.nodes().get(nodeId);
+        PlanGraph working = graph;
+        Set<String> seen = new java.util.HashSet<>();
+        while (cur != null && cur.groupId() != null && seen.add(cur.groupId())) {
+            PlanNode parent = working.nodes().get(cur.groupId());
+            if (parent instanceof GroupNode g && g.collapsed()) {
+                working = working.toggleGroupCollapsed(g.id());
+            }
+            cur = parent;
+        }
+        if (!working.equals(graph)) {
+            commitMutation(working);
+        }
+    }
+
+    private int searchBoxW() {
+        return Math.min(340, Math.max(180, viewport.viewWidth() - 24));
+    }
+
+    private int searchBoxX() {
+        return viewport.viewX() + (viewport.viewWidth() - searchBoxW()) / 2;
+    }
+
+    private int searchBoxY() {
+        return toolbarHeight + TAB_BAR_HEIGHT + 8;
+    }
+
+    private boolean isMouseOverSearchOverlay(double mx, double my) {
+        int sx = searchBoxX();
+        int sy = searchBoxY();
+        int sw = searchBoxW();
+        int rows = Math.min(7, searchResults.size());
+        int sh = 24 + (rows > 0 ? rows * 20 + 4 : 0);
+        return mx >= sx && mx <= sx + sw && my >= sy && my <= sy + sh;
+    }
+
+    private void renderSearchOverlay(GuiGraphics gfx, int mouseX, int mouseY) {
+        int sx = searchBoxX();
+        int sy = searchBoxY();
+        int sw = searchBoxW();
+
+        gfx.fill(sx + 2, sy + 2, sx + sw + 2, sy + 26, 0x66000000);
+        gfx.fill(sx, sy, sx + sw, sy + 24, Theme.MODAL_BG);
+        gfx.fill(sx, sy, sx + sw, sy + 1, Theme.ACCENT_TEAL);
+        gfx.fill(sx, sy + 23, sx + sw, sy + 24, Theme.ACCENT_TEAL);
+        gfx.fill(sx, sy, sx + 1, sy + 24, Theme.ACCENT_TEAL);
+        gfx.fill(sx + sw - 1, sy, sx + sw, sy + 24, Theme.ACCENT_TEAL);
+
+        String countLabel = searchResults.size() + "";
+        int countW = this.font.width(countLabel) + 8;
+        int textBudget = Math.max(40, sw - countW - 28);
+        String placeholder = Component.translatable("planomega.search.placeholder").getString();
+        boolean blink = (System.currentTimeMillis() / 500L) % 2L == 0L;
+        String display = searchQuery.isEmpty()
+                ? placeholder
+                : this.font.plainSubstrByWidth(searchQuery, textBudget) + (blink ? "|" : "");
+        gfx.drawString(this.font, display, sx + 8, sy + 8,
+                searchQuery.isEmpty() ? Theme.TEXT_MUTED : Theme.TEXT_PRIMARY, false);
+        gfx.drawString(this.font, countLabel, sx + sw - countW - 14, sy + 8, Theme.ACCENT_TEAL, false);
+        gfx.drawString(this.font, "x", sx + sw - 12, sy + 8, Theme.TEXT_SECONDARY, false);
+
+        int rows = Math.min(7, searchResults.size());
+        if (rows > 0) {
+            int dy = sy + 24;
+            int dh = rows * 20 + 2;
+            gfx.fill(sx, dy, sx + sw, dy + dh, 0xF0111822);
+            gfx.fill(sx, dy + dh - 1, sx + sw, dy + dh, Theme.BAR_BORDER);
+            gfx.fill(sx, dy, sx + 1, dy + dh, Theme.BAR_BORDER);
+            gfx.fill(sx + sw - 1, dy, sx + sw, dy + dh, Theme.BAR_BORDER);
+
+            for (int i = 0; i < rows; i++) {
+                SearchResultItem item = searchResults.get(i);
+                int ry = dy + 1 + i * 20;
+                boolean hovered = mouseX >= sx + 2 && mouseX <= sx + sw - 2 && mouseY >= ry && mouseY < ry + 20;
+                boolean selected = (i == searchSelectedIndex);
+                if (selected || hovered) {
+                    gfx.fill(sx + 2, ry, sx + sw - 2, ry + 20, selected ? Theme.BTN_ACTIVE : Theme.BTN_HOVER);
+                }
+                gfx.fill(sx + 6, ry + 5, sx + 9, ry + 15, item.badgeColor());
+                String title = this.font.plainSubstrByWidth(item.title(), sw / 2);
+                gfx.drawString(this.font, title, sx + 14, ry + 6, Theme.TEXT_PRIMARY, false);
+                String sub = this.font.plainSubstrByWidth(item.subtitle(), Math.max(20, sw / 2 - 20));
+                int subW = this.font.width(sub);
+                gfx.drawString(this.font, sub, sx + sw - subW - 8, ry + 6, Theme.TEXT_MUTED, false);
+            }
+        }
+    }
+
+    private boolean handleSearchOverlayClick(double mouseX, double mouseY, int button) {
+        int sx = searchBoxX();
+        int sy = searchBoxY();
+        int sw = searchBoxW();
+        if (mouseY >= sy && mouseY <= sy + 24 && mouseX >= sx + sw - 16 && mouseX <= sx + sw) {
+            closeSearch();
+            return true;
+        }
+        int rows = Math.min(7, searchResults.size());
+        int dy = sy + 24;
+        if (rows > 0 && mouseX >= sx && mouseX <= sx + sw && mouseY >= dy && mouseY <= dy + rows * 20) {
+            int idx = (int) ((mouseY - dy) / 20);
+            if (idx >= 0 && idx < rows) {
+                jumpToSearchResult(idx, true);
+                return true;
+            }
+        }
+        if (isMouseOverSearchOverlay(mouseX, mouseY)) {
+            return true;
+        }
+        closeSearch();
+        return false;
+    }
+
+    // ==================== JEI / EMI Queue, Recipe Switcher, Blueprints, SOURCE/SINK ====================
+
+    private void consumePendingXeiQueue() {
+        List<RecipeEntry> queuedRecipes = PendingRecipeQueue.drainAll();
+        if (!queuedRecipes.isEmpty()) {
+            PlanGraph next = graph;
+            RecipeNode lastNode = null;
+            selectedNodeIds.clear();
+            for (int i = 0; i < queuedRecipes.size(); i++) {
+                RecipeEntry entry = queuedRecipes.get(i);
+                double wx = CanvasViewport.snap(viewport.camX() - 105.0 + i * 32.0, snapToGrid);
+                double wy = CanvasViewport.snap(viewport.camY() - 55.0 + i * 24.0, snapToGrid);
+                RecipeNode node = entry.toRecipeNode(wx, wy);
+                next = next.withNode(node);
+                selectedNodeIds.add(node.id());
+                lastNode = node;
+            }
+            commitMutation(next);
+            if (queuedRecipes.size() == 1 && lastNode != null) {
+                showToast(Component.translatable("planomega.toast.added_recipe", queuedRecipes.get(0).title()).getString());
+            } else {
+                showToast(Component.translatable("planomega.toast.received_queued", queuedRecipes.size()).getString());
+            }
+        }
+
+        List<PlanGraph> queuedSubgraphs = PendingRecipeQueue.drainSubgraphs();
+        if (!queuedSubgraphs.isEmpty()) {
+            PlanGraph next = graph;
+            Set<String> insertedIds = new LinkedHashSet<>();
+            for (PlanGraph sub : queuedSubgraphs) {
+                PlanGraph cloned = GroupTemplateCodec.cloneWithFreshIds(sub, viewport.camX() - 200.0, viewport.camY() - 100.0);
+                next = next.mergeSubgraph(cloned);
+                insertedIds.addAll(cloned.nodes().keySet());
+            }
+            commitMutation(next);
+            selectedNodeIds.clear();
+            selectedNodeIds.addAll(insertedIds);
+            showToast(Component.translatable("planomega.toast.imported_tree", insertedIds.size()).getString());
+        }
+    }
+
+    private void importActiveEmiTree() {
+        IntegrationBridge.importActiveEmiTree().ifPresentOrElse(tree -> {
+            PlanGraph cloned = GroupTemplateCodec.cloneWithFreshIds(tree, viewport.camX() - 200.0, viewport.camY() - 100.0);
+            commitMutation(graph.mergeSubgraph(cloned));
+            selectedNodeIds.clear();
+            selectedNodeIds.addAll(cloned.nodes().keySet());
+            fitGraphToView();
+            showToast(Component.translatable("planomega.toast.imported_tree", cloned.nodes().size()).getString());
+        }, () -> showToast(Component.translatable("planomega.toast.no_emi_tree").getString()));
+    }
+
+    private void openRecipeSwitcher(RecipeNode recipe) {
+        openModal(RecipeSearchModal.forSwitch(recipe, newEntry -> {
+            RecipeNode switched = RecipeSearchModal.applySwitchToNode(recipe, newEntry);
+            PlanGraph next = graph.withNode(switched);
+            List<String> invalidEdges = new ArrayList<>();
+            for (PlanEdge edge : next.edges().values()) {
+                if (edge.fromNodeId().equals(switched.id()) && switched.findPort(edge.fromPortId()).isEmpty()) {
+                    invalidEdges.add(edge.id());
+                } else if (edge.toNodeId().equals(switched.id()) && switched.findPort(edge.toPortId()).isEmpty()) {
+                    invalidEdges.add(edge.id());
+                }
+            }
+            if (!invalidEdges.isEmpty()) {
+                next = next.withoutEdges(invalidEdges);
+            }
+            commitMutation(next);
+            showToast(Component.translatable("planomega.toast.switched_recipe", newEntry.title()).getString());
+        }));
+    }
+
+    private void copyBlueprintToClipboard() {
+        try {
+            String encoded = BlueprintCodec.encode(graph);
+            Minecraft.getInstance().keyboardHandler.setClipboard(encoded);
+            showToast(Component.translatable("planomega.toast.blueprint_copied").getString());
+        } catch (Exception ex) {
+            showToast("Blueprint encode error: " + ex.getMessage());
+        }
+    }
+
+    private void pasteBlueprintFromClipboard() {
+        String clip = Minecraft.getInstance().keyboardHandler.getClipboard();
+        if (!BlueprintCodec.isBlueprint(clip)) {
+            showToast(Component.translatable("planomega.toast.blueprint_invalid").getString());
+            return;
+        }
+        try {
+            PlanGraph decoded = BlueprintCodec.decode(clip);
+            openGraphInTab(decoded);
+            showToast(Component.translatable("planomega.toast.blueprint_pasted", decoded.name()).getString());
+        } catch (Exception ex) {
+            showToast(Component.translatable("planomega.toast.blueprint_invalid").getString());
+        }
+    }
+
+    private void createSourceNodeAt(double wx, double wy) {
+        VirtualRecipeNode src = VirtualRecipeNode.createSource(
+                PlanGraph.newId("src"),
+                wx, wy,
+                "Raw Source",
+                ResourceKey.item("minecraft:iron_ingot"),
+                1.0
+        );
+        commitMutation(graph.withNode(src));
+        selectedNodeIds.clear();
+        selectedNodeIds.add(src.id());
+        openEditorForNode(src);
+    }
+
+    private void createSinkNodeAt(double wx, double wy) {
+        VirtualRecipeNode sink = VirtualRecipeNode.createSink(
+                PlanGraph.newId("sink"),
+                wx, wy,
+                "Target Sink",
+                ResourceKey.item("gtceu:steel_ingot"),
+                1.0,
+                1.0
+        );
+        commitMutation(graph.withNode(sink));
+        selectedNodeIds.clear();
+        selectedNodeIds.add(sink.id());
+        openEditorForNode(sink);
+    }
+
+    private void createSourceForPort(PortHit portHit) {
+        PlanNode host = graph.nodes().get(portHit.nodeId());
+        if (host == null) {
+            return;
+        }
+        double wx = CanvasViewport.snap(host.x() - 250.0, snapToGrid);
+        double wy = CanvasViewport.snap(portHit.worldPos().y() - 40.0, snapToGrid);
+        ResourcePort port = portHit.port();
+        VirtualRecipeNode src = VirtualRecipeNode.createSource(
+                PlanGraph.newId("src"),
+                wx, wy,
+                "Source: " + port.displayLabel(),
+                port.resource(),
+                Math.max(1.0, port.amount())
+        );
+        PlanGraph next = graph.withNode(src);
+        if (!src.outputs().isEmpty()) {
+            ResourcePort outPort = src.outputs().get(0);
+            if (next.canConnect(src.id(), outPort.id(), host.id(), port.id())) {
+                next = next.withEdge(new PlanEdge(
+                        PlanGraph.newId("edge"),
+                        src.id(), outPort.id(), host.id(), port.id(),
+                        outPort.resource(), true
+                ));
+            }
+        }
+        commitMutation(next);
+        selectedNodeIds.clear();
+        selectedNodeIds.add(src.id());
+    }
+
+    private void createSinkForPort(PortHit portHit) {
+        PlanNode host = graph.nodes().get(portHit.nodeId());
+        if (host == null) {
+            return;
+        }
+        double wx = CanvasViewport.snap(host.x() + host.width() + 50.0, snapToGrid);
+        double wy = CanvasViewport.snap(portHit.worldPos().y() - 40.0, snapToGrid);
+        ResourcePort port = portHit.port();
+        VirtualRecipeNode sink = VirtualRecipeNode.createSink(
+                PlanGraph.newId("sink"),
+                wx, wy,
+                "Sink: " + port.displayLabel(),
+                port.resource(),
+                Math.max(1.0, port.amount()),
+                1.0
+        );
+        PlanGraph next = graph.withNode(sink);
+        if (!sink.inputs().isEmpty()) {
+            ResourcePort inPort = sink.inputs().get(0);
+            if (next.canConnect(host.id(), port.id(), sink.id(), inPort.id())) {
+                next = next.withEdge(new PlanEdge(
+                        PlanGraph.newId("edge"),
+                        host.id(), port.id(), sink.id(), inPort.id(),
+                        port.resource(), true
+                ));
+            }
+        }
+        commitMutation(next);
+        selectedNodeIds.clear();
+        selectedNodeIds.add(sink.id());
+    }
+
+    private static final class PlanTab {
+        PlanGraph graph;
+        final UndoHistory history = new UndoHistory(64);
+        final Set<String> selectedNodeIds = new LinkedHashSet<>();
+        @Nullable String selectedEdgeId;
+        @Nullable SolveResult solveResult;
+        @Nullable AuditReport auditReport;
+        double camX = 0.0;
+        double camY = 0.0;
+        double zoom = 1.0;
+        boolean initialFitDone = false;
+
+        PlanTab(PlanGraph graph) {
+            this.graph = graph;
+        }
+    }
+
+    private record TabRect(int x, int y, int w, int h, int closeX, int closeW, int index) {
+    }
+
+    private record SearchResultItem(String nodeId, String title, String subtitle, int badgeColor) {
     }
 }
