@@ -1,0 +1,71 @@
+modLoader = "javafml"
+loaderVersion = "[47,)"
+license = "${mod_license}"
+
+[[mods]]
+    modId = "${mod_id}"
+    version = "${version}"
+    displayName = "${mod_name}"
+    displayURL = "${mod_url}"
+    logoFile = "assets/planomega/textures/logo/plan_omega_logo_4x.png"
+    authors = "${mod_author}"
+    clientSideOnly = true
+    description = '''
+Client-side visual production planner, LP production balancer (ojAlgo), and recipe engineering sandbox for the TypeOmega ecosystem (GTCEu Modern, EMI/JEI, GuideME).
+'''
+
+    [[dependencies.${mod_id}]]
+        modId = "forge"
+        mandatory = true
+        versionRange = "[${forge_version},)"
+        ordering = "NONE"
+        side = "CLIENT"
+
+    [[dependencies.${mod_id}]]
+        modId = "minecraft"
+        mandatory = true
+        versionRange = "[${minecraft_version}]"
+        ordering = "NONE"
+        side = "CLIENT"
+
+    [[dependencies.${mod_id}]]
+        modId = "gtceu"
+        mandatory = false
+        versionRange = "[${gtceu_version},8.0.0)"
+        ordering = "AFTER"
+        side = "CLIENT"
+
+    [[dependencies.${mod_id}]]
+        modId = "emi"
+        mandatory = false
+        versionRange = "[1.1.0,)"
+        ordering = "AFTER"
+        side = "CLIENT"
+
+    [[dependencies.${mod_id}]]
+        modId = "jei"
+        mandatory = false
+        versionRange = "[15.0,)"
+        ordering = "AFTER"
+        side = "CLIENT"
+
+    [[dependencies.${mod_id}]]
+        modId = "ae2"
+        mandatory = false
+        versionRange = "[15,16)"
+        ordering = "AFTER"
+        side = "CLIENT"
+
+    [[dependencies.${mod_id}]]
+        modId = "gtna"
+        mandatory = false
+        versionRange = "[0.5.3,)"
+        ordering = "AFTER"
+        side = "CLIENT"
+
+    [[dependencies.${mod_id}]]
+        modId = "typeomega"
+        mandatory = false
+        versionRange = "*"
+        ordering = "AFTER"
+        side = "CLIENT"

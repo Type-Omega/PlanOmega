@@ -1,0 +1,171 @@
+plugins {
+    id 'idea'
+    id 'eclipse'
+    id 'maven-publish'
+    id 'net.neoforged.moddev.legacyforge' version '2.0.91'
+}
+
+sourceSets {
+    main.resources {
+        srcDir 'src/generated/resources'
+    }
+}
+
+repositories {
+    mavenLocal()
+    maven {
+        name = 'Type-Omega'
+        url = 'https://type-omega.github.io/maven/'
+        content {
+            includeGroup 'com.raishxn.gtna'
+            includeGroup 'com.typeomega'
+        }
+    }
+    mavenCentral()
+    maven {
+        name = 'GTCEu Maven'
+        url = 'https://maven.gtceu.com'
+        content {
+            includeGroup 'com.gregtechceu.gtceu'
+        }
+    }
+    maven {
+        name = 'FirstDarkDev'
+        url = 'https://maven.firstdark.dev/snapshots/'
+    }
+    maven {
+        name = 'Registrate'
+        url = 'https://maven.tterrag.com/'
+        content {
+            includeGroup 'com.tterrag.registrate'
+        }
+    }
+    maven {
+        name = 'BlameJared'
+        url = 'https://maven.blamejared.com/'
+    }
+    maven {
+        name = 'TerraformersMC'
+        url = 'https://maven.terraformersmc.com/'
+    }
+    maven {
+        name = 'CurseMaven'
+        url = 'https://cursemaven.com/'
+        content {
+            includeGroup 'curse.maven'
+        }
+    }
+    maven {
+        name = 'Modrinth'
+        url = 'https://api.modrinth.com/maven'
+        content {
+            includeGroup 'maven.modrinth'
+        }
+    }
+}
+
+version = mod_version
+group = maven_group
+base {
+    archivesName = archives_base_name
+}
+java {
+    sourceCompatibility = targetCompatibility = JavaVersion.VERSION_17
+}
+
+legacyForge {
+    version = "${minecraft_version}-${forge_version}"
+
+    parchment {
+        mappingsVersion = project.mapping_version
+        minecraftVersion = project.mapping_version == '' ? null : project.minecraft_version
+    }
+
+    runs {
+        configureEach {
+            systemProperty 'forge.logging.markers', 'REGISTRIES'
+            logLevel = org.slf4j.event.Level.DEBUG
+        }
+        client {
+            client()
+            sourceSet = sourceSets.main
+            systemProperty('forge.enabledGameTestNamespaces', project.mod_id)
+            if (project.hasProperty('quickPlay')) {
+                programArguments.addAll('--quickPlaySingleplayer', project.property('quickPlay').toString())
+            }
+        }
+    }
+
+    mods {
+        "${mod_id}" {
+            sourceSet(sourceSets.main)
+        }
+    }
+}
+
+dependencies {
+    compileOnly("org.jetbrains:annotations:26.0.1")
+
+    // Pure-Java LP Solver (ojAlgo) bundled via Jar-in-Jar and available on Forge dev runtime classpath
+    implementation("org.ojalgo:ojalgo:${ojalgo_version}")
+    additionalRuntimeClasspath("org.ojalgo:ojalgo:${ojalgo_version}")
+    jarJar("org.ojalgo:ojalgo:${ojalgo_version}")
+
+    // Soft/Optional mod integrations (compileOnly in production, optional dev runtime via -PplanomegaDevMods=true)
+    modCompileOnly("mezz.jei:jei-${minecraft_version}-forge-api:${jei_version}")
+    modCompileOnly("mezz.jei:jei-${minecraft_version}-common-api:${jei_version}")
+    modCompileOnly("dev.emi:emi-forge:${emi_version}+${minecraft_version}:api")
+
+    modCompileOnly("com.gregtechceu.gtceu:gtceu-${minecraft_version}:${gtceu_version}:slim") { transitive = false }
+    modCompileOnly("com.lowdragmc.ldlib:ldlib-forge-${minecraft_version}:${ldlib_version}") { transitive = false }
+    modCompileOnly("com.tterrag.registrate:Registrate:${registrate_version}")
+    modCompileOnly("dev.toma.configuration:configuration-forge-${minecraft_version}:${configuration_version}")
+    modCompileOnly("com.raishxn.gtna:gtna:${gtna_version}") { transitive = false }
+    modCompileOnly("curse.maven:applied-energistics-2-223794:7148487") { transitive = false }
+
+    if (project.findProperty('planomegaDevMods') == 'true') {
+        modRuntimeOnly("mezz.jei:jei-${minecraft_version}-forge:${jei_version}")
+        modRuntimeOnly("dev.emi:emi-forge:${emi_version}+${minecraft_version}")
+        modRuntimeOnly("com.gregtechceu.gtceu:gtceu-${minecraft_version}:${gtceu_version}:slim") { transitive = false }
+        modRuntimeOnly("com.lowdragmc.ldlib:ldlib-forge-${minecraft_version}:${ldlib_version}") { transitive = false }
+        modRuntimeOnly("com.tterrag.registrate:Registrate:${registrate_version}")
+        modRuntimeOnly("dev.toma.configuration:configuration-forge-${minecraft_version}:${configuration_version}")
+    }
+
+    // Unit testing (graph model, LP solver, overclock math, audit & exports)
+    testImplementation("com.google.code.gson:gson:2.10")
+    testImplementation("org.junit.jupiter:junit-jupiter:${junit_version}")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+}
+
+tasks.named('test', Test).configure {
+    useJUnitPlatform()
+}
+
+tasks.named('processResources', ProcessResources).configure {
+    var properties = [
+            "mod_license"      : mod_license,
+            "mod_id"           : mod_id,
+            "version"          : version,
+            "mod_name"         : mod_name,
+            "mod_url"          : mod_url,
+            "mod_author"       : mod_author,
+            "forge_version"    : forge_version.split("\\.")[0],
+            "minecraft_version": minecraft_version,
+            "gtceu_version"    : gtceu_version,
+    ]
+    inputs.properties(properties)
+
+    filesMatching("META-INF/mods.toml") {
+        expand properties + [project: project]
+    }
+}
+
+tasks.named('jar', Jar).configure {
+    finalizedBy 'reobfJar'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = "UTF-8"
+    options.release.set(17)
+}
