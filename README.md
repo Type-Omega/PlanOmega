@@ -94,6 +94,12 @@ The compiled JAR is output to `build/libs/planomega-0.1.0.jar` (bundles `ojAlgo`
 
 ---
 
+## Inspiration & Credits
+
+**Plan Omega** was directly inspired by **[PlanNH](https://github.com/GTNewHorizons/PlanNH)** (created by **Sbancuz** and contributors for Minecraft 1.7.10 / GregTech: New Horizons), which pioneered the in-game flowchart-based production planner workflow. Plan Omega brings that spirit to Minecraft 1.20.1 (Forge) with an embedded `ojAlgo` LP solver, GTCEu Modern coil/parallelism realism, AE2 integration, and KubeJS sandbox exporting.
+
+---
+
 ## License
 
 Licensed under the [MIT License](LICENSE). Created by **Raishxn** (**Type-Omega**).
