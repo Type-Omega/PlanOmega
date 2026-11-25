@@ -71,6 +71,7 @@ base {
 }
 java {
     sourceCompatibility = targetCompatibility = JavaVersion.VERSION_17
+    withSourcesJar()
 }
 
 legacyForge {
@@ -168,4 +169,32 @@ tasks.named('jar', Jar).configure {
 tasks.withType(JavaCompile).configureEach {
     options.encoding = "UTF-8"
     options.release.set(17)
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            groupId = project.maven_group
+            artifactId = project.archives_base_name
+            version = project.version.toString()
+            from components.java
+            pom {
+                name = project.mod_name
+                description = 'Client-side visual production planner, LP production balancer, and recipe engineering sandbox for Minecraft 1.20.1 / GTCEu Modern.'
+                url = 'https://github.com/Type-Omega/PlanOmega'
+                licenses {
+                    license {
+                        name = 'MIT'
+                        url = 'https://opensource.org/licenses/MIT'
+                    }
+                }
+            }
+        }
+    }
+    repositories {
+        maven {
+            name = 'localRepo'
+            url = layout.buildDirectory.dir('repo')
+        }
+    }
 }
