@@ -37,6 +37,7 @@ import java.util.zip.GZIPOutputStream;
  */
 public final class PlanCodec {
 
+    public static final int CODEC_SCHEMA_VERSION = 2;
     public static final String SHARE_PREFIX = "PLANOMEGA1:";
     private static final int MAX_SHARE_BYTES = 8 * 1024 * 1024;
     private static final Gson PRETTY_GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
@@ -117,7 +118,8 @@ public final class PlanCodec {
 
     public static JsonObject serializeGraph(PlanGraph graph) {
         JsonObject root = new JsonObject();
-        root.addProperty("schemaVersion", graph.schemaVersion());
+        int schemaVersion = Math.max(graph.schemaVersion(), hasV2Fields(graph) ? CODEC_SCHEMA_VERSION : 1);
+        root.addProperty("schemaVersion", schemaVersion);
         root.addProperty("id", graph.id());
         root.addProperty("name", graph.name());
         root.addProperty("author", graph.author());
@@ -168,6 +170,12 @@ public final class PlanCodec {
             }
             if (r.lockedRate() != null) {
                 obj.addProperty("lockedRate", r.lockedRate());
+            }
+            if (r.coilTier() != null) {
+                obj.addProperty("coilTier", r.coilTier());
+            }
+            if (r.parallelCount() > 1) {
+                obj.addProperty("parallelCount", r.parallelCount());
             }
         } else if (node instanceof VirtualRecipeNode v) {
             obj.addProperty("type", "virtual_recipe");
@@ -306,14 +314,23 @@ public final class PlanCodec {
         return new PlanGraph(schema, id, name, author, description, nodes, edges);
     }
 
-    private static int migrateSchemaIfNeeded(JsonObject root, int rawSchema) {
-        // Legacy v0 (or missing schemaVersion) migrates cleanly to CURRENT_SCHEMA_VERSION.
-        if (rawSchema <= 0) {
-            return PlanGraph.CURRENT_SCHEMA_VERSION;
+    private static boolean hasV2Fields(PlanGraph graph) {
+        for (PlanNode node : graph.nodes().values()) {
+            if (node instanceof RecipeNode r && (r.coilTier() != null || r.parallelCount() > 1)) {
+                return true;
+            }
         }
-        // Future schema versions are loaded best-effort and normalized to CURRENT_SCHEMA_VERSION.
-        if (rawSchema > PlanGraph.CURRENT_SCHEMA_VERSION) {
-            return PlanGraph.CURRENT_SCHEMA_VERSION;
+        return false;
+    }
+
+    private static int migrateSchemaIfNeeded(JsonObject root, int rawSchema) {
+        // Legacy v0 (or missing schemaVersion) migrates cleanly to CODEC_SCHEMA_VERSION.
+        if (rawSchema <= 0) {
+            return CODEC_SCHEMA_VERSION;
+        }
+        // Future schema versions are loaded best-effort and normalized to CODEC_SCHEMA_VERSION.
+        if (rawSchema > CODEC_SCHEMA_VERSION) {
+            return CODEC_SCHEMA_VERSION;
         }
         return rawSchema;
     }
@@ -346,7 +363,9 @@ public final class PlanCodec {
                     Math.max(1, getInt(obj, "parallelLimit", 1)),
                     getNullableDouble(obj, "targetRate"),
                     getNullableString(obj, "targetPortId"),
-                    getNullableDouble(obj, "lockedRate")
+                    getNullableDouble(obj, "lockedRate"),
+                    getNullableString(obj, "coilTier"),
+                    Math.max(1, getInt(obj, "parallelCount", 1))
             );
             case "virtual_recipe" -> new VirtualRecipeNode(
                     id, x, y, width, height, groupId,

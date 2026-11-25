@@ -31,8 +31,45 @@ public record RecipeNode(
         int parallelLimit,
         @Nullable Double targetRate,
         @Nullable String targetPortId,
-        @Nullable Double lockedRate
+        @Nullable Double lockedRate,
+        @Nullable String coilTier,
+        int parallelCount
 ) implements ProcessNode {
+
+    /**
+     * Backward-compatible constructor defaulting {@code coilTier} to {@code null}
+     * and {@code parallelCount} to {@code 1}.
+     */
+    public RecipeNode(
+            String id,
+            double x,
+            double y,
+            double width,
+            double height,
+            @Nullable String groupId,
+            String recipeId,
+            String recipeTypeId,
+            @Nullable String machineId,
+            String title,
+            List<ResourcePort> inputs,
+            List<ResourcePort> outputs,
+            long eut,
+            int durationTicks,
+            int tier,
+            @Nullable Integer circuit,
+            int coilTemp,
+            boolean cleanroom,
+            boolean perfectOverclock,
+            int parallelLimit,
+            @Nullable Double targetRate,
+            @Nullable String targetPortId,
+            @Nullable Double lockedRate
+    ) {
+        this(id, x, y, width, height, groupId, recipeId, recipeTypeId, machineId, title,
+                inputs, outputs, eut, durationTicks, tier, circuit, coilTemp, cleanroom,
+                perfectOverclock, parallelLimit, targetRate, targetPortId, lockedRate,
+                null, 1);
+    }
 
     public RecipeNode {
         Objects.requireNonNull(id, "id");
@@ -53,6 +90,12 @@ public record RecipeNode(
         if (parallelLimit <= 0) {
             parallelLimit = 1;
         }
+        if (coilTier != null && coilTier.isBlank()) {
+            coilTier = null;
+        }
+        if (parallelCount <= 0) {
+            parallelCount = 1;
+        }
     }
 
     @Override
@@ -62,7 +105,8 @@ public record RecipeNode(
                 recipeId, recipeTypeId, machineId, title,
                 inputs, outputs, eut, durationTicks, tier,
                 circuit, coilTemp, cleanroom, perfectOverclock,
-                parallelLimit, targetRate, targetPortId, lockedRate
+                parallelLimit, targetRate, targetPortId, lockedRate,
+                coilTier, parallelCount
         );
     }
 
@@ -73,7 +117,8 @@ public record RecipeNode(
                 recipeId, recipeTypeId, machineId, title,
                 inputs, outputs, eut, durationTicks, tier,
                 circuit, coilTemp, cleanroom, perfectOverclock,
-                parallelLimit, targetRate, targetPortId, lockedRate
+                parallelLimit, targetRate, targetPortId, lockedRate,
+                coilTier, parallelCount
         );
     }
 
@@ -84,7 +129,8 @@ public record RecipeNode(
                 recipeId, recipeTypeId, machineId, title,
                 inputs, outputs, eut, durationTicks, tier,
                 circuit, coilTemp, cleanroom, perfectOverclock,
-                parallelLimit, targetRate, targetPortId, lockedRate
+                parallelLimit, targetRate, targetPortId, lockedRate,
+                coilTier, parallelCount
         );
     }
 
@@ -94,7 +140,41 @@ public record RecipeNode(
                 recipeId, recipeTypeId, machineId, title,
                 inputs, outputs, eut, durationTicks, tier,
                 circuit, coilTemp, cleanroom, perfectOverclock,
-                parallelLimit, targetRate, targetPortId, lockedRate
+                parallelLimit, targetRate, targetPortId, lockedRate,
+                coilTier, parallelCount
+        );
+    }
+
+    public RecipeNode withCoilTier(@Nullable String newCoilTier) {
+        return new RecipeNode(
+                id, x, y, width, height, groupId,
+                recipeId, recipeTypeId, machineId, title,
+                inputs, outputs, eut, durationTicks, tier,
+                circuit, coilTemp, cleanroom, perfectOverclock,
+                parallelLimit, targetRate, targetPortId, lockedRate,
+                newCoilTier, parallelCount
+        );
+    }
+
+    public RecipeNode withParallelCount(int newParallelCount) {
+        return new RecipeNode(
+                id, x, y, width, height, groupId,
+                recipeId, recipeTypeId, machineId, title,
+                inputs, outputs, eut, durationTicks, tier,
+                circuit, coilTemp, cleanroom, perfectOverclock,
+                parallelLimit, targetRate, targetPortId, lockedRate,
+                coilTier, newParallelCount
+        );
+    }
+
+    public RecipeNode withCoilAndParallel(@Nullable String newCoilTier, int newParallelCount) {
+        return new RecipeNode(
+                id, x, y, width, height, groupId,
+                recipeId, recipeTypeId, machineId, title,
+                inputs, outputs, eut, durationTicks, tier,
+                circuit, coilTemp, cleanroom, perfectOverclock,
+                parallelLimit, targetRate, targetPortId, lockedRate,
+                newCoilTier, newParallelCount
         );
     }
 }

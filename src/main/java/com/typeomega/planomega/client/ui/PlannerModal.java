@@ -3,6 +3,7 @@ package com.typeomega.planomega.client.ui;
 import com.typeomega.planomega.audit.AuditReport;
 import com.typeomega.planomega.client.storage.PlanStorage;
 import com.typeomega.planomega.codec.DemoGraphFactory;
+import com.typeomega.planomega.codec.GroupTemplateCodec;
 import com.typeomega.planomega.codec.PlanCodec;
 import com.typeomega.planomega.export.AiAnalysisExporter;
 import com.typeomega.planomega.export.MermaidExporter;
@@ -25,6 +26,7 @@ import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.network.chat.Component;
+import net.minecraftforge.fml.loading.FMLPaths;
 import org.lwjgl.glfw.GLFW;
 
 import java.util.ArrayList;
@@ -586,18 +588,22 @@ public abstract class PlannerModal {
         private EditBox targetRateBox;
         private int tier;
         private boolean perfectOc;
+        private @org.jetbrains.annotations.Nullable String coilTier;
+        private int parallelCount;
 
         public NodeConfigModal(
                 ProcessNode node,
                 Consumer<ProcessNode> onSave,
                 @org.jetbrains.annotations.Nullable Consumer<VirtualRecipeNode> onCloneSandbox
         ) {
-            super(350, 195);
+            super(350, 235);
             this.node = node;
             this.onSave = onSave;
             this.onCloneSandbox = onCloneSandbox;
             this.tier = node.tier();
             this.perfectOc = node.perfectOverclock();
+            this.coilTier = node.coilTier();
+            this.parallelCount = Math.max(1, node.parallelCount());
         }
 
         @Override
@@ -626,13 +632,43 @@ public abstract class PlannerModal {
                 rebuild(font, screenW, screenH, targetRateBox.getValue());
             }));
 
-            buttons.add(new ModalButton(x + 165, y + 78, 150, 18,
+            buttons.add(new ModalButton(x + 165, y + 78, 171, 18,
                     "Perfect OC: " + (perfectOc ? "ON" : "OFF"),
                     perfectOc ? Theme.ACCENT_TEAL : Theme.BTN_BORDER,
                     () -> {
                         perfectOc = !perfectOc;
                         rebuild(font, screenW, screenH, targetRateBox.getValue());
                     }));
+
+            if (node instanceof RecipeNode) {
+                ProcessNode.CoilTier currentCoil = ProcessNode.CoilTier.fromId(coilTier);
+                String coilLabel = currentCoil != null
+                        ? currentCoil.displayName() + " (" + currentCoil.temperatureK() + "K)"
+                        : Component.translatable("planomega.modal.target.coil_none").getString();
+                buttons.add(new ModalButton(x + 14, y + 118, 180, 18,
+                        coilLabel,
+                        currentCoil != null ? Theme.ACCENT_AMBER : Theme.BTN_BORDER,
+                        () -> {
+                            ProcessNode.CoilTier[] tiers = ProcessNode.CoilTier.values();
+                            if (currentCoil == null) {
+                                coilTier = tiers[0].id();
+                            } else {
+                                int nextIdx = currentCoil.ordinal() + 1;
+                                coilTier = nextIdx < tiers.length ? tiers[nextIdx].id() : null;
+                            }
+                            rebuild(font, screenW, screenH, targetRateBox.getValue());
+                        }));
+
+                buttons.add(new ModalButton(x + 202, y + 118, 134, 18,
+                        Component.translatable("planomega.modal.target.parallel_btn", parallelCount).getString(),
+                        parallelCount > 1 ? Theme.ACCENT_TEAL : Theme.BTN_BORDER,
+                        () -> {
+                            List<Integer> opts = ProcessNode.PARALLEL_OPTIONS;
+                            int idx = opts.indexOf(parallelCount);
+                            parallelCount = opts.get((idx + 1) % opts.size());
+                            rebuild(font, screenW, screenH, targetRateBox.getValue());
+                        }));
+            }
 
             buttons.add(new ModalButton(x + 14, y + height - 30, 78, 20,
                     Component.translatable("planomega.modal.target.clear").getString(), 0xFFEF4444, () -> {
@@ -701,7 +737,7 @@ public abstract class PlannerModal {
                         r.inputs(), r.outputs(), r.eut(), r.durationTicks(),
                         tier, r.circuit(), r.coilTemp(), r.cleanroom(), perfectOc,
                         r.parallelLimit(), parsedTarget, portId, r.lockedRate()
-                );
+                ).withCoilAndParallel(coilTier, parallelCount);
             } else {
                 VirtualRecipeNode v = (VirtualRecipeNode) node;
                 String portId = v.targetPortId() != null ? v.targetPortId()
@@ -728,6 +764,11 @@ public abstract class PlannerModal {
             String tierName = vt.shortName() + " (" + vt.voltage() + ")";
             int tw = font.width(tierName);
             gfx.drawString(font, tierName, x + 42 + (70 - tw) / 2, y + 83, vt.badgeColor(), false);
+
+            if (node instanceof RecipeNode) {
+                gfx.drawString(font, Component.translatable("planomega.modal.target.coil_label"), x + 14, y + 106, Theme.TEXT_SECONDARY, false);
+                gfx.drawString(font, Component.translatable("planomega.modal.target.parallel_label"), x + 202, y + 106, Theme.TEXT_SECONDARY, false);
+            }
         }
     }
 
@@ -741,9 +782,10 @@ public abstract class PlannerModal {
         private final AuditReport audit;
         private final Consumer<String> onToast;
         private String preview = "";
+        private boolean confirmKubeJsOverwrite = false;
 
         public ExportModal(PlanGraph graph, SolveResult solve, AuditReport audit, Consumer<String> onToast) {
-            super(430, 260);
+            super(430, 275);
             this.graph = graph;
             this.solve = solve;
             this.audit = audit;
@@ -765,15 +807,36 @@ public abstract class PlannerModal {
                     copyPayload(SandboxDiffExporter.toMarkdownDiff(graph, id -> RecipeCatalogManager.get().findById(id)),
                             "planomega.toast.exported_diff")));
 
-            buttons.add(new ModalButton(x + 14, y + 64, 196, 22, "KubeJS Script", Theme.ACCENT_AMBER, () ->
+            buttons.add(new ModalButton(x + 14, y + 64, 128, 22, "KubeJS Script", Theme.ACCENT_AMBER, () ->
                     copyPayload(SandboxDiffExporter.toKubeJsScript(graph), "planomega.toast.exported_kubejs")));
-            buttons.add(new ModalButton(x + 218, y + 64, 198, 22, "TypeOmega Java", Theme.ACCENT_AMBER, () ->
+            buttons.add(new ModalButton(x + 150, y + 64, 130, 22,
+                    Component.translatable("planomega.modal.export.save_kubejs").getString(), Theme.ACCENT_TEAL,
+                    this::saveKubeJsToServerScripts));
+            buttons.add(new ModalButton(x + 288, y + 64, 128, 22, "TypeOmega Java", Theme.ACCENT_AMBER, () ->
                     copyPayload(SandboxDiffExporter.toTypeOmegaJava(graph), "planomega.toast.exported_java")));
 
             buttons.add(new ModalButton(x + width - 86, y + height - 28, 72, 20,
                     Component.translatable("planomega.ui.close").getString(), Theme.BTN_BORDER, this::close));
 
             this.preview = AiAnalysisExporter.exportJson(graph, solve, audit);
+        }
+
+        private void saveKubeJsToServerScripts() {
+            try {
+                SandboxDiffExporter.KubeJsSaveResult res = SandboxDiffExporter.saveKubeJsScript(
+                        graph, FMLPaths.GAMEDIR.get(), confirmKubeJsOverwrite);
+                if (res.requiresOverwriteConfirmation()) {
+                    confirmKubeJsOverwrite = true;
+                    onToast.accept(Component.translatable("planomega.toast.kubejs_confirm_overwrite").getString());
+                    return;
+                }
+                confirmKubeJsOverwrite = false;
+                this.preview = SandboxDiffExporter.toKubeJsScript(graph);
+                Minecraft.getInstance().keyboardHandler.setClipboard(res.reloadCommand());
+                onToast.accept(Component.translatable("planomega.toast.kubejs_saved", res.reloadCommand()).getString());
+            } catch (Exception e) {
+                onToast.accept("KubeJS save failed: " + e.getMessage());
+            }
         }
 
         private void copyPayload(String payload, String toastKey) {
@@ -800,6 +863,177 @@ public abstract class PlannerModal {
                 }
                 gfx.drawString(font, font.plainSubstrByWidth(line, boxW - 12), boxX + 6, ly, Theme.TEXT_SECONDARY, false);
                 ly += 10;
+            }
+        }
+    }
+
+    /**
+     * Modal for saving a {@link GroupNode} or selected subgraph as a reusable template in
+     * {@code config/planomega/templates/}.
+     */
+    public static final class SaveTemplateModal extends PlannerModal {
+        private final String defaultName;
+        private final PlanGraph subgraph;
+        private final Consumer<String> onToast;
+        private EditBox nameBox;
+        private EditBox descBox;
+
+        public SaveTemplateModal(String defaultName, PlanGraph subgraph, Consumer<String> onToast) {
+            super(340, 155);
+            this.defaultName = defaultName == null || defaultName.isBlank() ? "Group Template" : defaultName;
+            this.subgraph = subgraph;
+            this.onToast = onToast;
+        }
+
+        @Override
+        public void init(Font font, int screenW, int screenH) {
+            editBoxes.clear();
+            buttons.clear();
+            int x = left(screenW);
+            int y = top(screenH);
+
+            nameBox = new EditBox(font, x + 14, y + 38, width - 28, 18, Component.empty());
+            nameBox.setMaxLength(64);
+            nameBox.setValue(defaultName);
+            nameBox.setFocused(true);
+            editBoxes.add(nameBox);
+
+            descBox = new EditBox(font, x + 14, y + 76, width - 28, 18, Component.empty());
+            descBox.setMaxLength(160);
+            editBoxes.add(descBox);
+
+            buttons.add(new ModalButton(x + width - 150, y + height - 28, 64, 18,
+                    Component.translatable("planomega.ui.cancel").getString(), Theme.BTN_BORDER, this::close));
+            buttons.add(new ModalButton(x + width - 80, y + height - 28, 66, 18,
+                    Component.translatable("planomega.ui.save").getString(), Theme.ACCENT_TEAL, this::saveAndClose));
+        }
+
+        private void saveAndClose() {
+            String tplName = nameBox.getValue().trim();
+            if (tplName.isEmpty()) {
+                tplName = defaultName;
+            }
+            try {
+                PlanStorage.saveGroupTemplate(tplName, descBox.getValue().trim(), subgraph);
+                onToast.accept(Component.translatable("planomega.toast.template_saved", tplName).getString());
+                close();
+            } catch (Exception e) {
+                onToast.accept("Save failed: " + e.getMessage());
+            }
+        }
+
+        @Override
+        protected void renderContents(GuiGraphics gfx, Font font, int x, int y, int mouseX, int mouseY, float partialTick) {
+            gfx.drawString(font, Component.translatable("planomega.modal.template_save.title"), x + 14, y + 10, Theme.ACCENT_TEAL, false);
+            gfx.drawString(font, Component.translatable("planomega.modal.template_save.name_label"), x + 14, y + 26, Theme.TEXT_SECONDARY, false);
+            gfx.drawString(font, Component.translatable("planomega.modal.template_save.desc_label"), x + 14, y + 64, Theme.TEXT_SECONDARY, false);
+        }
+    }
+
+    /**
+     * Modal listing saved group templates from {@code config/planomega/templates/}
+     * so they can be instantiated into the active {@link PlanGraph}.
+     */
+    public static final class GroupTemplatesModal extends PlannerModal {
+        private final double targetX;
+        private final double targetY;
+        private final Consumer<PlanGraph> onInsertSubgraph;
+        private final Consumer<String> onToast;
+        private List<PlanStorage.SavedTemplateEntry> templates = List.of();
+        private final List<ModalButton> dynamicListButtons = new ArrayList<>();
+
+        public GroupTemplatesModal(
+                double targetX,
+                double targetY,
+                Consumer<PlanGraph> onInsertSubgraph,
+                Consumer<String> onToast
+        ) {
+            super(420, 250);
+            this.targetX = targetX;
+            this.targetY = targetY;
+            this.onInsertSubgraph = onInsertSubgraph;
+            this.onToast = onToast;
+        }
+
+        @Override
+        public void init(Font font, int screenW, int screenH) {
+            editBoxes.clear();
+            buttons.clear();
+            dynamicListButtons.clear();
+            int x = left(screenW);
+            int y = top(screenH);
+
+            buttons.add(new ModalButton(x + width - 86, y + height - 28, 72, 18,
+                    Component.translatable("planomega.ui.close").getString(), Theme.BTN_BORDER, this::close));
+
+            refreshList(x, y);
+        }
+
+        private void refreshList(int x, int y) {
+            templates = PlanStorage.listGroupTemplates();
+            dynamicListButtons.clear();
+            int rowY = y + 36;
+            int maxRows = 7;
+            for (int i = 0; i < Math.min(maxRows, templates.size()); i++) {
+                PlanStorage.SavedTemplateEntry entry = templates.get(i);
+                dynamicListButtons.add(new ModalButton(x + 278, rowY, 64, 16,
+                        Component.translatable("planomega.ui.insert").getString(), Theme.ACCENT_TEAL, () -> {
+                    try {
+                        GroupTemplateCodec.GroupTemplate tpl = PlanStorage.loadGroupTemplate(entry.path());
+                        PlanGraph instantiated = GroupTemplateCodec.instantiate(tpl, targetX, targetY);
+                        onInsertSubgraph.accept(instantiated);
+                        onToast.accept(Component.translatable("planomega.toast.template_inserted", tpl.name()).getString());
+                        close();
+                    } catch (Exception e) {
+                        onToast.accept("Load failed: " + e.getMessage());
+                    }
+                }));
+                dynamicListButtons.add(new ModalButton(x + 348, rowY, 58, 16,
+                        Component.translatable("planomega.ui.delete").getString(), 0xFFEF4444, () -> {
+                    try {
+                        PlanStorage.deleteGroupTemplate(entry.path());
+                        refreshList(x, y);
+                    } catch (Exception ignored) {
+                    }
+                }));
+                rowY += 24;
+            }
+        }
+
+        @Override
+        public void render(GuiGraphics gfx, Font font, int screenW, int screenH, int mouseX, int mouseY, float partialTick) {
+            super.render(gfx, font, screenW, screenH, mouseX, mouseY, partialTick);
+            for (ModalButton btn : dynamicListButtons) {
+                btn.render(gfx, font, mouseX, mouseY);
+            }
+        }
+
+        @Override
+        public boolean mouseClicked(double mouseX, double mouseY, int button, int screenW, int screenH) {
+            if (button == 0) {
+                for (ModalButton btn : dynamicListButtons) {
+                    if (btn.isHovered(mouseX, mouseY)) {
+                        btn.onClick.run();
+                        return true;
+                    }
+                }
+            }
+            return super.mouseClicked(mouseX, mouseY, button, screenW, screenH);
+        }
+
+        @Override
+        protected void renderContents(GuiGraphics gfx, Font font, int x, int y, int mouseX, int mouseY, float partialTick) {
+            gfx.drawString(font, Component.translatable("planomega.modal.templates.title"), x + 14, y + 10, Theme.ACCENT_TEAL, false);
+            if (templates.isEmpty()) {
+                gfx.drawString(font, Component.translatable("planomega.modal.templates.empty"), x + 14, y + 40, Theme.TEXT_MUTED, false);
+            } else {
+                int rowY = y + 40;
+                for (int i = 0; i < Math.min(7, templates.size()); i++) {
+                    PlanStorage.SavedTemplateEntry entry = templates.get(i);
+                    String label = font.plainSubstrByWidth(entry.name() + " (" + entry.nodeCount() + ")", 255);
+                    gfx.drawString(font, label, x + 16, rowY, Theme.TEXT_PRIMARY, false);
+                    rowY += 24;
+                }
             }
         }
     }

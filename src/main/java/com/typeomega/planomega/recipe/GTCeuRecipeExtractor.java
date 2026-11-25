@@ -1,7 +1,6 @@
 package com.typeomega.planomega.recipe;
 
 import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
 import com.gregtechceu.gtceu.api.capability.recipe.EURecipeCapability;
 import com.gregtechceu.gtceu.api.capability.recipe.FluidRecipeCapability;
 import com.gregtechceu.gtceu.api.capability.recipe.IO;
@@ -10,6 +9,7 @@ import com.gregtechceu.gtceu.api.capability.recipe.RecipeCapability;
 import com.gregtechceu.gtceu.api.recipe.GTRecipe;
 import com.gregtechceu.gtceu.api.recipe.RecipeCondition;
 import com.gregtechceu.gtceu.api.recipe.RecipeHelper;
+import com.gregtechceu.gtceu.api.recipe.ResearchData;
 import com.gregtechceu.gtceu.api.recipe.chance.logic.ChanceLogic;
 import com.gregtechceu.gtceu.api.recipe.content.Content;
 import com.gregtechceu.gtceu.api.recipe.ingredient.EnergyStack;
@@ -18,10 +18,13 @@ import com.gregtechceu.gtceu.api.recipe.ingredient.IntCircuitIngredient;
 import com.gregtechceu.gtceu.api.recipe.ingredient.SizedIngredient;
 import com.gregtechceu.gtceu.common.item.IntCircuitBehaviour;
 import com.gregtechceu.gtceu.common.recipe.condition.CleanroomCondition;
+import com.gregtechceu.gtceu.common.recipe.condition.ResearchCondition;
 import com.typeomega.planomega.model.PortDirection;
 import com.typeomega.planomega.model.ResourceKey;
 import com.typeomega.planomega.model.ResourcePort;
 import com.typeomega.planomega.model.VoltageTier;
+import com.typeomega.planomega.recipe.GTCeuRecipeParsingHelpers.ChanceInput;
+import com.typeomega.planomega.recipe.GTCeuRecipeParsingHelpers.ChanceMode;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.Ingredient;
@@ -32,7 +35,9 @@ import net.minecraftforge.registries.ForgeRegistries;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Isolated GTCEu Modern (7.5.3) recipe extractor. Only classloaded when {@code gtceu} is present.
@@ -135,21 +140,30 @@ public final class GTCeuRecipeExtractor {
         }
 
         long eut = resolveSignedEut(recipe);
-        int tier = VoltageTier.fromEut(eut).index();
+        long fusionStartEu = recipe.data != null && recipe.data.contains("eu_to_start")
+                ? recipe.data.getLong("eu_to_start")
+                : 0L;
+        int tier = Math.max(
+                VoltageTier.fromEut(eut).index(),
+                GTCeuRecipeParsingHelpers.computeFusionMinTier(fusionStartEu)
+        );
         int duration = Math.max(1, recipe.duration);
         int coilTemp = recipe.data != null && recipe.data.contains("ebf_temp") ? recipe.data.getInt("ebf_temp") : 0;
         boolean cleanroom = hasCleanroomCondition(recipe);
+        Set<String> researchIds = extractResearchIds(recipe);
 
         String typeId = recipe.recipeType != null && recipe.recipeType.registryName != null
                 ? recipe.recipeType.registryName.toString()
                 : "gtceu:unknown";
-        String machineLabel = prettyMachineName(typeId);
+        String machineLabel = GTCeuRecipeParsingHelpers.prettyMachineName(typeId);
         boolean perfectOc = typeId.endsWith("large_chemical_reactor");
+        boolean isAssemblyLine = typeId.endsWith("assembly_line") || !researchIds.isEmpty();
+        boolean hasCatalyst = inputs.stream().anyMatch(ResourcePort::catalyst);
 
-        String title = buildTitle(outputs, inputs, machineLabel);
+        String title = GTCeuRecipeParsingHelpers.buildTitle(outputs, inputs, machineLabel);
         ResourceLocation rid = recipe.getId();
 
-        return new RecipeEntry(
+        RecipeEntry baseEntry = new RecipeEntry(
                 rid.toString(),
                 typeId,
                 rid.getNamespace(),
@@ -167,6 +181,32 @@ public final class GTCeuRecipeExtractor {
                 perfectOc,
                 1,
                 null
+        );
+        String extendedBlob = GTCeuRecipeParsingHelpers.buildExtendedSearchBlob(
+                baseEntry.searchBlob(),
+                researchIds,
+                fusionStartEu,
+                isAssemblyLine,
+                hasCatalyst
+        );
+        return new RecipeEntry(
+                baseEntry.recipeId(),
+                baseEntry.recipeTypeId(),
+                baseEntry.sourceMod(),
+                baseEntry.machineId(),
+                baseEntry.title(),
+                baseEntry.machineLabel(),
+                baseEntry.inputs(),
+                baseEntry.outputs(),
+                baseEntry.eut(),
+                baseEntry.durationTicks(),
+                baseEntry.tier(),
+                baseEntry.circuit(),
+                baseEntry.coilTemp(),
+                baseEntry.cleanroom(),
+                baseEntry.perfectOverclock(),
+                baseEntry.parallelLimit(),
+                extendedBlob
         );
     }
 
@@ -203,9 +243,9 @@ public final class GTCeuRecipeExtractor {
         }
         Ingredient inner = SizedIngredient.getInner(ing);
 
-        boolean catalyst = dir == PortDirection.INPUT && content.chance == 0;
+        boolean catalyst = GTCeuRecipeParsingHelpers.isCatalystInput(dir, content.chance);
         double chance = catalyst ? 1.0 : effectiveChance;
-        double boost = content.maxChance > 0 ? (double) content.tierChanceBoost / content.maxChance : 0.0;
+        double boost = GTCeuRecipeParsingHelpers.computeTierChanceBoost(content.tierChanceBoost, content.maxChance);
 
         String tagId = extractItemTagId(inner);
         if (tagId != null) {
@@ -249,12 +289,7 @@ public final class GTCeuRecipeExtractor {
     private static @Nullable String extractItemTagId(Ingredient inner) {
         try {
             JsonElement json = inner.toJson();
-            if (json.isJsonObject()) {
-                JsonObject obj = json.getAsJsonObject();
-                if (obj.has("tag") && obj.get("tag").isJsonPrimitive()) {
-                    return obj.get("tag").getAsString();
-                }
-            }
+            return GTCeuRecipeParsingHelpers.extractTagFromJson(json);
         } catch (Throwable ignored) {
             // Non-serializable custom ingredients fall back to getItems()
         }
@@ -269,22 +304,25 @@ public final class GTCeuRecipeExtractor {
             double effectiveChance
     ) {
         int amount = Math.max(1, ing.getAmount());
-        boolean catalyst = dir == PortDirection.INPUT && content.chance == 0;
+        boolean catalyst = GTCeuRecipeParsingHelpers.isCatalystInput(dir, content.chance);
         double chance = catalyst ? 1.0 : effectiveChance;
-        double boost = content.maxChance > 0 ? (double) content.tierChanceBoost / content.maxChance : 0.0;
+        double boost = GTCeuRecipeParsingHelpers.computeTierChanceBoost(content.tierChanceBoost, content.maxChance);
 
-        if (ing.values != null && ing.values.length == 1 && ing.values[0] instanceof FluidIngredient.TagValue tagValue) {
-            ResourceLocation tagLoc = tagValue.tag().location();
-            return new ResourcePort(
-                    portId,
-                    dir,
-                    ResourceKey.tag(tagLoc.toString()),
-                    amount,
-                    chance,
-                    boost,
-                    catalyst,
-                    null
-            );
+        if (ing.values != null && ing.values.length > 0 && ing.values[0] instanceof FluidIngredient.TagValue tagValue) {
+            FluidStack[] stacks = ing.getStacks();
+            if (ing.values.length == 1 || stacks == null || stacks.length == 0) {
+                ResourceLocation tagLoc = tagValue.tag().location();
+                return new ResourcePort(
+                        portId,
+                        dir,
+                        ResourceKey.tag(tagLoc.toString()),
+                        amount,
+                        chance,
+                        boost,
+                        catalyst,
+                        null
+                );
+            }
         }
 
         FluidStack[] stacks = ing.getStacks();
@@ -319,58 +357,23 @@ public final class GTCeuRecipeExtractor {
     }
 
     private static double[] computeEffectiveChances(List<Content> contents, ChanceLogic logic) {
-        double[] result = new double[contents.size()];
-        if (contents.isEmpty()) {
-            return result;
+        List<ChanceInput> inputs = new ArrayList<>(contents.size());
+        for (Content c : contents) {
+            inputs.add(new ChanceInput(c.chance, c.maxChance, c.tierChanceBoost));
         }
-
+        ChanceMode mode;
         if (logic == ChanceLogic.NONE) {
-            java.util.Arrays.fill(result, 1.0);
-            return result;
+            mode = ChanceMode.NONE;
+        } else if (logic == ChanceLogic.XOR) {
+            mode = ChanceMode.XOR;
+        } else if (logic == ChanceLogic.FIRST) {
+            mode = ChanceMode.FIRST;
+        } else if (logic == ChanceLogic.AND) {
+            mode = ChanceMode.AND;
+        } else {
+            mode = ChanceMode.OR;
         }
-
-        if (logic == ChanceLogic.XOR) {
-            double chancedSum = 0.0;
-            for (Content c : contents) {
-                if (c.maxChance > 0 && c.chance > 0 && c.chance < c.maxChance) {
-                    chancedSum += (double) c.chance / c.maxChance;
-                }
-            }
-            double norm = chancedSum > 1.0 ? chancedSum : 1.0;
-            for (int i = 0; i < contents.size(); i++) {
-                Content c = contents.get(i);
-                if (c.maxChance > 0 && c.chance > 0 && c.chance < c.maxChance) {
-                    result[i] = Math.min(1.0, ((double) c.chance / c.maxChance) / norm);
-                } else {
-                    result[i] = 1.0;
-                }
-            }
-            return result;
-        }
-
-        if (logic == ChanceLogic.FIRST) {
-            double remainingProb = 1.0;
-            for (int i = 0; i < contents.size(); i++) {
-                Content c = contents.get(i);
-                if (c.maxChance > 0 && c.chance > 0 && c.chance < c.maxChance) {
-                    double p = Math.min(1.0, (double) c.chance / c.maxChance);
-                    result[i] = remainingProb * p;
-                    remainingProb *= (1.0 - p);
-                } else {
-                    result[i] = 1.0;
-                }
-            }
-            return result;
-        }
-
-        // ChanceLogic.OR and ChanceLogic.AND both have marginal probability chance / maxChance
-        for (int i = 0; i < contents.size(); i++) {
-            Content c = contents.get(i);
-            result[i] = c.maxChance > 0 && c.chance > 0
-                    ? Math.min(1.0, (double) c.chance / c.maxChance)
-                    : 1.0;
-        }
-        return result;
+        return GTCeuRecipeParsingHelpers.computeEffectiveChances(inputs, mode);
     }
 
     private static long resolveSignedEut(GTRecipe recipe) {
@@ -405,31 +408,20 @@ public final class GTCeuRecipeExtractor {
         return false;
     }
 
-    private static String buildTitle(List<ResourcePort> outputs, List<ResourcePort> inputs, String machineLabel) {
-        if (!outputs.isEmpty()) {
-            String suffix = outputs.size() > 1 ? " +" + (outputs.size() - 1) : "";
-            return outputs.get(0).displayLabel() + suffix + " (" + machineLabel + ")";
+    private static Set<String> extractResearchIds(GTRecipe recipe) {
+        if (recipe.conditions == null) {
+            return Set.of();
         }
-        if (!inputs.isEmpty()) {
-            return inputs.get(0).displayLabel() + " (" + machineLabel + ")";
-        }
-        return machineLabel;
-    }
-
-    private static String prettyMachineName(String typeId) {
-        int colon = typeId.indexOf(':');
-        String path = colon >= 0 ? typeId.substring(colon + 1) : typeId;
-        String[] parts = path.split("_");
-        StringBuilder sb = new StringBuilder();
-        for (String p : parts) {
-            if (p.isEmpty()) {
-                continue;
+        Set<String> ids = new LinkedHashSet<>();
+        for (RecipeCondition<?> condition : recipe.conditions) {
+            if (condition instanceof ResearchCondition research && research.getData() != null) {
+                for (ResearchData.ResearchEntry entry : research.getData()) {
+                    if (entry.getResearchId() != null && !entry.getResearchId().isBlank()) {
+                        ids.add(entry.getResearchId());
+                    }
+                }
             }
-            if (!sb.isEmpty()) {
-                sb.append(' ');
-            }
-            sb.append(Character.toUpperCase(p.charAt(0))).append(p.substring(1));
         }
-        return sb.toString();
+        return ids;
     }
 }

@@ -7,8 +7,10 @@ import com.typeomega.planomega.model.PlanGraph;
 import com.typeomega.planomega.model.PlanNode;
 import com.typeomega.planomega.model.ProcessNode;
 import com.typeomega.planomega.model.ResourceKey;
+import com.typeomega.planomega.model.ResourceKind;
 import com.typeomega.planomega.model.ResourcePort;
 import com.typeomega.planomega.model.VoltageTier;
+import com.typeomega.planomega.solver.OverclockCalculator;
 import com.typeomega.planomega.solver.SolveResult;
 import com.typeomega.planomega.solver.SolveResult.NodeSolveStats;
 
@@ -60,9 +62,9 @@ public final class ChainAuditor {
             }
         }
 
-        // 1. Solved-metric audits (bottlenecks, orphan byproducts, recycle imbalance)
+        // 1. Solved-metric audits (bottlenecks, hatch throughput, orphan/unconnected byproducts, recycle imbalance)
         if (solve != null && solve.isSolved()) {
-            auditSolvedMetrics(activeNodes, solve, intendedTargetResources, flags);
+            auditSolvedMetrics(graph, activeNodes, solve, intendedTargetResources, flags);
         }
 
         // 2. Structural & progression audits (redundant passthroughs, artificial direct jumps)
@@ -137,6 +139,7 @@ public final class ChainAuditor {
     }
 
     private static void auditSolvedMetrics(
+            PlanGraph graph,
             List<ProcessNode> nodes,
             SolveResult solve,
             Set<ResourceKey> intendedTargets,
@@ -145,6 +148,11 @@ public final class ChainAuditor {
         long activeCount = solve.nodeStats().values().stream()
                 .filter(s -> s.craftsPerSecond() > 1e-6)
                 .count();
+
+        Set<String> connectedOutPorts = new HashSet<>();
+        for (PlanEdge edge : graph.edges().values()) {
+            connectedOutPorts.add(edge.fromNodeId() + ":" + edge.fromPortId());
+        }
 
         for (ProcessNode proc : nodes) {
             NodeSolveStats stats = solve.nodeStats().get(proc.id());
@@ -172,10 +180,16 @@ public final class ChainAuditor {
                         null,
                         String.format("Machine spam (%dx): %s", stats.machinesCeil(), proc.title()),
                         String.format("Requires %d machines at %s.", stats.machinesCeil(),
-                                com.typeomega.planomega.model.VoltageTier.byIndex(stats.machineTier()).shortName()),
+                                VoltageTier.byIndex(stats.machineTier()).shortName()),
                         "Increase machine tier/overclock, enable parallels, or shorten recipe duration."
                 ));
             }
+
+            // Hatch / Throughput Bottleneck check
+            auditHatchThroughput(proc, stats, flags);
+
+            // Unconnected Byproduct / Void Risk check
+            auditUnconnectedByproducts(proc, stats, intendedTargets, connectedOutPorts, flags);
         }
 
         // Orphan byproducts & recycle imbalances
@@ -250,5 +264,117 @@ public final class ChainAuditor {
             }
         }
         return null;
+    }
+
+    private static void auditHatchThroughput(
+            ProcessNode proc,
+            NodeSolveStats stats,
+            List<FrictionFlag> flags
+    ) {
+        int recipeTier = VoltageTier.fromEut(proc.eut()).index();
+        boolean overclockedOrParallel = stats.machineTier() > recipeTier
+                || stats.subtickParallels() > 1
+                || stats.parallelCount() > 1;
+        if (!overclockedOrParallel) {
+            return;
+        }
+
+        double cyclesPerTick = (double) (Math.max(1, stats.subtickParallels()) * Math.max(1, stats.parallelCount()))
+                / Math.max(1, stats.effectiveTicks());
+        double maxItemsPerTick = 0.0;
+        double maxFluidPerTick = 0.0;
+        ResourceKey peakItemRes = null;
+        ResourceKey peakFluidRes = null;
+
+        for (ResourcePort p : proc.inputs()) {
+            if (p.catalyst()) {
+                continue;
+            }
+            double perTick = p.amount() * cyclesPerTick;
+            if (p.resource().kind() == ResourceKind.ITEM && perTick > maxItemsPerTick) {
+                maxItemsPerTick = perTick;
+                peakItemRes = p.resource();
+            } else if (p.resource().kind() == ResourceKind.FLUID && perTick > maxFluidPerTick) {
+                maxFluidPerTick = perTick;
+                peakFluidRes = p.resource();
+            }
+        }
+        for (ResourcePort p : proc.outputs()) {
+            double perTick = p.amount() * cyclesPerTick;
+            if (p.resource().kind() == ResourceKind.ITEM && perTick > maxItemsPerTick) {
+                maxItemsPerTick = perTick;
+                peakItemRes = p.resource();
+            } else if (p.resource().kind() == ResourceKind.FLUID && perTick > maxFluidPerTick) {
+                maxFluidPerTick = perTick;
+                peakFluidRes = p.resource();
+            }
+        }
+
+        double tierItemCap = 4.0 * Math.pow(2.0, Math.max(0, stats.machineTier() - 1));
+        double tierFluidCap = 400.0 * Math.pow(2.0, Math.max(0, stats.machineTier() - 1));
+        boolean itemBottleneck = maxItemsPerTick > tierItemCap;
+        boolean fluidBottleneck = maxFluidPerTick > tierFluidCap;
+
+        if (itemBottleneck || fluidBottleneck) {
+            String tierName = VoltageTier.byIndex(stats.machineTier()).shortName();
+            String detail = fluidBottleneck
+                    ? String.format("%.0f mB/t per machine exceeds typical %s hatch/pipe capacity (%.0f mB/t).",
+                    maxFluidPerTick, tierName, tierFluidCap)
+                    : String.format("%.1f items/t per machine exceeds typical %s bus capacity (%.0f/t).",
+                    maxItemsPerTick, tierName, tierItemCap);
+            flags.add(new FrictionFlag(
+                    Category.BOTTLENECK_HATCH,
+                    Severity.WARNING,
+                    proc.id(),
+                    fluidBottleneck ? peakFluidRes : peakItemRes,
+                    "Hatch throughput bottleneck: " + proc.title(),
+                    detail,
+                    "Upgrade input/output hatches/buses, use quadruple hatches or ME/AE2 P2P interfaces, or reduce overclock/parallels."
+            ));
+        }
+    }
+
+    private static void auditUnconnectedByproducts(
+            ProcessNode proc,
+            NodeSolveStats stats,
+            Set<ResourceKey> intendedTargets,
+            Set<String> connectedOutPorts,
+            List<FrictionFlag> flags
+    ) {
+        if (proc.outputs().size() <= 1) {
+            return;
+        }
+        String primaryPortId = proc.targetPortId();
+        if (primaryPortId == null && proc.targetRate() != null && !proc.outputs().isEmpty()) {
+            primaryPortId = proc.outputs().get(0).id();
+        }
+        int ocSteps = Math.max(0, stats.machineTier() - VoltageTier.fromEut(proc.eut()).index());
+        for (int i = 0; i < proc.outputs().size(); i++) {
+            ResourcePort out = proc.outputs().get(i);
+            if (out.catalyst() || out.id().equals(primaryPortId) || intendedTargets.contains(out.resource())) {
+                continue;
+            }
+            if (i == 0 && connectedOutPorts.contains(proc.id() + ":" + out.id())) {
+                continue;
+            }
+            if (connectedOutPorts.contains(proc.id() + ":" + out.id())) {
+                continue;
+            }
+            double ratePerSec = OverclockCalculator.expectedAmountPerCraft(out, ocSteps) * stats.craftsPerSecond();
+            double threshold = out.resource().kind() == ResourceKind.FLUID ? 1.0 : 0.05;
+            if (ratePerSec > threshold) {
+                String unit = out.resource().kind() == ResourceKind.FLUID ? " mB/s" : "/s";
+                flags.add(new FrictionFlag(
+                        Category.UNCONNECTED_BYPRODUCT,
+                        Severity.WARNING,
+                        proc.id(),
+                        out.resource(),
+                        "Unconnected byproduct (void risk): " + out.resource().shortName(),
+                        String.format("Output port '%s' produces %.2f%s with no outgoing edge; machine may stall if unvoided.",
+                                out.id(), ratePerSec, unit),
+                        "Connect this byproduct to a consumer/recycling loop or add a voiding/overflow hatch."
+                ));
+            }
+        }
     }
 }

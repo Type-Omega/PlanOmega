@@ -17,6 +17,7 @@ import com.typeomega.planomega.model.VirtualRecipeNode;
 import com.typeomega.planomega.model.VoltageTier;
 import com.typeomega.planomega.solver.OverclockCalculator;
 import com.typeomega.planomega.solver.SolveResult;
+import com.typeomega.planomega.solver.SolveResult.MachineBomEntry;
 import com.typeomega.planomega.solver.SolveResult.NodeSolveStats;
 
 import java.util.Map;
@@ -46,6 +47,7 @@ public final class AiAnalysisExporter {
         summary.addProperty("totalMachinesCeil", solve.totalMachinesCeil());
         summary.add("netImportsPerSec", serializeRateMap(solve.netImports()));
         summary.add("netExportsPerSec", serializeRateMap(solve.netExports()));
+        summary.add("machineBom", serializeMachineBom(solve));
         root.add("summary", summary);
 
         JsonArray nodesArr = new JsonArray();
@@ -78,6 +80,12 @@ public final class AiAnalysisExporter {
             }
             if (proc.coilTemp() > 0) {
                 nObj.addProperty("coilTempK", proc.coilTemp());
+            }
+            if (proc.coilTier() != null) {
+                nObj.addProperty("coilTier", proc.coilTier());
+            }
+            if (proc.parallelCount() > 1) {
+                nObj.addProperty("parallelCount", proc.parallelCount());
             }
             if (proc.cleanroom()) {
                 nObj.addProperty("cleanroom", true);
@@ -144,6 +152,36 @@ public final class AiAnalysisExporter {
             }
             double perSec = OverclockCalculator.expectedAmountPerCraft(p, ocSteps) * craftsPerSec;
             obj.addProperty("ratePerSec", round4(perSec));
+            arr.add(obj);
+        }
+        return arr;
+    }
+
+    private static JsonArray serializeMachineBom(SolveResult solve) {
+        JsonArray arr = new JsonArray();
+        for (MachineBomEntry entry : solve.machineBom()) {
+            JsonObject obj = new JsonObject();
+            obj.addProperty("machineKey", entry.machineKey());
+            obj.addProperty("displayName", entry.displayName());
+            obj.addProperty("tier", VoltageTier.byIndex(entry.tier()).shortName());
+            obj.addProperty("machineCount", entry.machineCount());
+            obj.addProperty("multiblock", entry.multiblock());
+            if (entry.multiblock()) {
+                obj.addProperty("inputBuses", entry.inputBuses());
+                obj.addProperty("outputBuses", entry.outputBuses());
+                obj.addProperty("inputHatches", entry.inputHatches());
+                obj.addProperty("outputHatches", entry.outputHatches());
+                obj.addProperty("energyHatches", entry.energyHatches());
+                if (entry.coilTier() != null) {
+                    obj.addProperty("coilTier", entry.coilTier());
+                }
+                if (entry.estimatedCoils() > 0) {
+                    obj.addProperty("estimatedCoils", entry.estimatedCoils());
+                }
+                if (entry.parallelHatches() > 0) {
+                    obj.addProperty("parallelHatches", entry.parallelHatches());
+                }
+            }
             arr.add(obj);
         }
         return arr;

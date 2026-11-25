@@ -16,11 +16,17 @@ import com.typeomega.planomega.model.VirtualRecipeNode;
 import com.typeomega.planomega.solver.ProductionSolver;
 import com.typeomega.planomega.solver.SolveResult;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class AuditAndExportTest {
@@ -143,5 +149,61 @@ class AuditAndExportTest {
         assertTrue(javaCode.contains(".outputFluids(GTMaterials.get(\"hot_argon\").getFluid(500))"));
         assertTrue(javaCode.contains(".circuitMeta(2)"));
         assertTrue(javaCode.contains(".blastFurnaceTemp(2700)"));
+    }
+
+    @Test
+    void auditorDetectsHatchThroughputBottleneckAndUnconnectedByproduct() {
+        // LV (tier 1, fluid hatch capacity ~8000 mB/s) forced to transfer 50,000 mB/s per machine -> BOTTLENECK_HATCH
+        // Plus an unconnected byproduct fluid output -> UNCONNECTED_BYPRODUCT
+        RecipeNode highThroughput = new RecipeNode(
+                "ht", 0, 0, 0, 0, null, "gtceu:centrifuge/heavy", "gtceu:centrifuge", null, "Heavy Centrifuge",
+                List.of(ResourcePort.input("in_mix", ResourceKey.fluid("gtceu:heavy_mix"), 2500)),
+                List.of(
+                        ResourcePort.output("out_main", ResourceKey.item("gtceu:iron_dust"), 1),
+                        ResourcePort.output("out_byprod", ResourceKey.fluid("gtceu:sulfur_sludge"), 2500)
+                ),
+                30, 2, 2, null, 0, false, false, 16, 20.0, "out_main", null
+        );
+        PlanGraph graph = PlanGraph.empty("Hatch Audit").withNode(highThroughput);
+        SolveResult solve = ProductionSolver.solve(graph);
+        AuditReport report = ChainAuditor.audit(graph, solve);
+
+        assertTrue(report.flags().stream().anyMatch(f -> f.category() == Category.BOTTLENECK_HATCH));
+        assertTrue(report.flags().stream().anyMatch(f -> f.category() == Category.UNCONNECTED_BYPRODUCT
+                && ResourceKey.fluid("gtceu:sulfur_sludge").equals(f.resource())));
+
+        String mermaid = MermaidExporter.exportMermaid(graph, solve, report);
+        assertTrue(mermaid.contains("Machine BOM"));
+        String aiJson = AiAnalysisExporter.exportJson(graph, solve, report);
+        assertTrue(aiJson.contains("\"machineBom\""));
+    }
+
+    @Test
+    void kubeJsDirectSaveCreatesBackupAndRespectsOverwriteFlag(@TempDir Path gameDir) throws IOException {
+        VirtualRecipeNode v = new VirtualRecipeNode(
+                "v1", 0, 0, 0, 0, null, "gtceu:macerator/test", "gtceu:macerator", null, "Test Macerator",
+                List.of(ResourcePort.input("in", ResourceKey.item("minecraft:cobblestone"), 1)),
+                List.of(ResourcePort.output("out", ResourceKey.item("minecraft:sand"), 1)),
+                8, 20, 0, null, 0, false, false, "note", null, null
+        );
+        PlanGraph graph = PlanGraph.empty("KubeJS Save").withNode(v);
+
+        assertFalse(SandboxDiffExporter.kubeJsScriptExists(gameDir));
+        SandboxDiffExporter.KubeJsSaveResult first = SandboxDiffExporter.saveKubeJsScript(graph, gameDir, false);
+        assertTrue(first.saved());
+        assertFalse(first.requiresOverwriteConfirmation());
+        assertTrue(Files.exists(first.scriptPath()));
+        assertEquals("/kubejs reload server_scripts", first.reloadCommand());
+
+        // Second save without confirmOverwrite prompts instead of overwriting
+        SandboxDiffExporter.KubeJsSaveResult prompt = SandboxDiffExporter.saveKubeJsScript(graph, gameDir, false);
+        assertFalse(prompt.saved());
+        assertTrue(prompt.requiresOverwriteConfirmation());
+
+        // Confirmed overwrite creates .bak
+        SandboxDiffExporter.KubeJsSaveResult overwrite = SandboxDiffExporter.saveKubeJsScript(graph, gameDir, true);
+        assertTrue(overwrite.saved());
+        assertNotNull(overwrite.backupPath());
+        assertTrue(Files.exists(overwrite.backupPath()));
     }
 }

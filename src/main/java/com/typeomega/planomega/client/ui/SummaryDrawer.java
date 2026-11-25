@@ -7,7 +7,9 @@ import com.typeomega.planomega.model.PlanNode;
 import com.typeomega.planomega.model.ProcessNode;
 import com.typeomega.planomega.model.ResourceKey;
 import com.typeomega.planomega.model.ResourceKind;
+import com.typeomega.planomega.model.VoltageTier;
 import com.typeomega.planomega.solver.SolveResult;
+import com.typeomega.planomega.solver.SolveResult.MachineBomEntry;
 import com.typeomega.planomega.solver.SolveResult.NodeSolveStats;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphics;
@@ -130,6 +132,45 @@ public final class SummaryDrawer {
                 gfx.drawString(font, metric, padX + innerW - mw, cy + 2, Theme.ACCENT_AMBER, false);
                 clickableNodes.add(new ClickableRow(padX - 2, cy - 1, innerW + 4, 14, proc.id()));
                 cy += 15;
+            }
+        }
+
+        // Machine BOM (grouped by type/tier + multiblock coils/hatches)
+        if (!result.machineBom().isEmpty() && cy + 24 < y + height) {
+            cy += 4;
+            gfx.drawString(font, Component.translatable("planomega.summary.bom"), padX, cy, Theme.TEXT_PRIMARY, false);
+            cy += 12;
+
+            int bomShown = 0;
+            for (MachineBomEntry bom : result.machineBom()) {
+                if (cy + 14 > y + height - 6 || bomShown >= 6) {
+                    break;
+                }
+                String tierName = VoltageTier.byIndex(bom.tier()).shortName();
+                StringBuilder extra = new StringBuilder();
+                if (bom.multiblock()) {
+                    if (bom.estimatedCoils() > 0) {
+                        extra.append(bom.estimatedCoils()).append("c");
+                    }
+                    if (bom.parallelHatches() > 0) {
+                        if (extra.length() > 0) extra.append(' ');
+                        extra.append("PH:").append(bom.parallelHatches());
+                    }
+                    int hatches = bom.inputBuses() + bom.outputBuses() + bom.inputHatches() + bom.outputHatches();
+                    if (hatches > 0) {
+                        if (extra.length() > 0) extra.append(' ');
+                        extra.append("H:").append(hatches);
+                    }
+                }
+                String right = extra.isEmpty()
+                        ? bom.machineCount() + "x " + tierName
+                        : bom.machineCount() + "x " + tierName + " [" + extra + "]";
+                int rw = font.width(right);
+                String name = font.plainSubstrByWidth(bom.displayName(), Math.max(24, innerW - rw - 8));
+                gfx.drawString(font, name, padX, cy + 1, Theme.TEXT_SECONDARY, false);
+                gfx.drawString(font, right, padX + innerW - rw, cy + 1, Theme.ACCENT_TEAL, false);
+                cy += 12;
+                bomShown++;
             }
         }
 

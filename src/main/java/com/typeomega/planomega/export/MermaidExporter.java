@@ -9,6 +9,7 @@ import com.typeomega.planomega.model.ProcessNode;
 import com.typeomega.planomega.model.ResourceKind;
 import com.typeomega.planomega.model.VoltageTier;
 import com.typeomega.planomega.solver.SolveResult;
+import com.typeomega.planomega.solver.SolveResult.MachineBomEntry;
 import com.typeomega.planomega.solver.SolveResult.NodeSolveStats;
 
 import java.text.DecimalFormat;
@@ -71,6 +72,33 @@ public final class MermaidExporter {
             sb.append("    ").append(from).append(" -->|\"").append(escape(label)).append("\"| ").append(to).append('\n');
         }
 
+        if (solve != null && solve.isSolved() && !solve.machineBom().isEmpty()) {
+            sb.append("\n    %% Machine BOM\n");
+            for (MachineBomEntry entry : solve.machineBom()) {
+                String tierName = VoltageTier.byIndex(entry.tier()).shortName();
+                sb.append("    %% - ").append(entry.machineCount()).append("x ")
+                        .append(entry.displayName()).append(" (").append(tierName).append(')');
+                if (entry.multiblock()) {
+                    sb.append(" [IB:").append(entry.inputBuses())
+                            .append(" OB:").append(entry.outputBuses())
+                            .append(" IH:").append(entry.inputHatches())
+                            .append(" OH:").append(entry.outputHatches())
+                            .append(" EH:").append(entry.energyHatches());
+                    if (entry.estimatedCoils() > 0) {
+                        sb.append(" Coils:").append(entry.estimatedCoils());
+                        if (entry.coilTier() != null) {
+                            sb.append('(').append(entry.coilTier()).append(')');
+                        }
+                    }
+                    if (entry.parallelHatches() > 0) {
+                        sb.append(" PH:").append(entry.parallelHatches());
+                    }
+                    sb.append(']');
+                }
+                sb.append('\n');
+            }
+        }
+
         return sb.toString();
     }
 
@@ -89,6 +117,12 @@ public final class MermaidExporter {
         NodeSolveStats stats = solve != null && solve.isSolved() ? solve.nodeStats().get(proc.id()) : null;
         if (stats != null && stats.craftsPerSecond() > 1e-6) {
             label.append(" • ").append(FMT.format(stats.machinesExact())).append("x");
+        }
+        if (proc.coilTier() != null) {
+            label.append(" • ").append(proc.coilTier());
+        }
+        if (proc.parallelCount() > 1) {
+            label.append(" • P").append(proc.parallelCount());
         }
         String cssClass = proc.isVirtual() ? "sandbox" : "recipe";
         if (audit != null && !audit.forNode(proc.id()).isEmpty()) {

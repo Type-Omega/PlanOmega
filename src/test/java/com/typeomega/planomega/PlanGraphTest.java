@@ -1,6 +1,7 @@
 package com.typeomega.planomega;
 
 import com.typeomega.planomega.codec.DemoGraphFactory;
+import com.typeomega.planomega.codec.GroupTemplateCodec;
 import com.typeomega.planomega.model.GroupNode;
 import com.typeomega.planomega.model.PlanEdge;
 import com.typeomega.planomega.model.PlanGraph;
@@ -113,5 +114,48 @@ class PlanGraphTest {
         PlanGraph redone = history.redo(undone);
         assertEquals("Renamed", redone.name());
         assertNull(redone.nodes().get("missing"));
+    }
+
+    @Test
+    void extractSubgraphCloneWithFreshIdsAndMergePreserveInternalEdges() {
+        PlanGraph graph = DemoGraphFactory.createSampleSulfuricAcidPlan();
+        PlanGraph sub = graph.extractSubgraph(List.of("node_so2", "node_so3"));
+        assertEquals(2, sub.nodes().size());
+        assertEquals(1, sub.edges().size());
+
+        PlanGraph cloned = GroupTemplateCodec.cloneWithFreshIds(sub, 120.0, 80.0);
+        assertEquals(2, cloned.nodes().size());
+        assertEquals(1, cloned.edges().size());
+        assertFalse(cloned.nodes().containsKey("node_so2"));
+        assertFalse(cloned.nodes().containsKey("node_so3"));
+
+        PlanGraph merged = graph.mergeSubgraph(cloned);
+        assertEquals(graph.nodes().size() + 2, merged.nodes().size());
+        assertEquals(graph.edges().size() + 1, merged.edges().size());
+    }
+
+    @Test
+    void autoConnectWiresCompatiblePortsAndRespectsCloseLoopsFlag() {
+        RecipeNode a = new RecipeNode(
+                "a", 0, 0, 0, 0, null, "r:a", "t:a", null, "A",
+                List.of(ResourcePort.input("in_rec", ResourceKey.fluid("gtceu:acid"), 500)),
+                List.of(ResourcePort.output("out_slurry", ResourceKey.fluid("gtceu:slurry"), 1000)),
+                8, 20, 0, null, 0, false, false, 1, null, null, null
+        );
+        RecipeNode b = new RecipeNode(
+                "b", 250, 0, 0, 0, null, "r:b", "t:b", null, "B",
+                List.of(ResourcePort.input("in_slurry", ResourceKey.fluid("gtceu:slurry"), 1000)),
+                List.of(ResourcePort.output("out_rec", ResourceKey.fluid("gtceu:acid"), 500)),
+                8, 20, 0, null, 0, false, false, 1, null, null, null
+        );
+
+        PlanGraph base = PlanGraph.empty("AutoConnect").withNode(a).withNode(b);
+        PlanGraph.AutoConnectResult noLoops = base.autoConnect(false);
+        assertEquals(1, noLoops.connectionsAdded());
+        assertEquals(1, noLoops.graph().edges().size());
+
+        PlanGraph.AutoConnectResult withLoops = base.autoConnect(true);
+        assertEquals(2, withLoops.connectionsAdded());
+        assertEquals(2, withLoops.graph().edges().size());
     }
 }

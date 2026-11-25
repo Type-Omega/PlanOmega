@@ -35,9 +35,11 @@ public record FrictionFlag(
 
     public enum Category {
         ORPHAN_BYPRODUCT,
+        UNCONNECTED_BYPRODUCT,
         BOTTLENECK_ENERGY,
         BOTTLENECK_MACHINES,
         BOTTLENECK_TIME,
+        BOTTLENECK_HATCH,
         REDUNDANT_PASSTHROUGH,
         ARTIFICIAL_JUMP,
         RECYCLE_IMBALANCE

@@ -6,7 +6,13 @@ import com.typeomega.planomega.model.ResourceKind;
 import com.typeomega.planomega.model.ResourcePort;
 import com.typeomega.planomega.model.VirtualRecipeNode;
 import com.typeomega.planomega.recipe.RecipeEntry;
+import org.jetbrains.annotations.Nullable;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -21,7 +27,96 @@ import java.util.function.Function;
  */
 public final class SandboxDiffExporter {
 
+    public static final String DEFAULT_KUBEJS_SCRIPT_RELATIVE_PATH = "kubejs/server_scripts/planomega_sandbox.js";
+    public static final String KUBEJS_RELOAD_COMMAND = "/kubejs reload server_scripts";
+
+    public record KubeJsSaveResult(
+            boolean saved,
+            boolean requiresOverwriteConfirmation,
+            Path scriptPath,
+            @Nullable Path backupPath,
+            String reloadCommand,
+            String message
+    ) {
+    }
+
     private SandboxDiffExporter() {
+    }
+
+    public static String getKubeJsReloadCommand() {
+        return KUBEJS_RELOAD_COMMAND;
+    }
+
+    public static Path resolveDefaultKubeJsScriptPath(Path gameDir) {
+        return gameDir.resolve(DEFAULT_KUBEJS_SCRIPT_RELATIVE_PATH);
+    }
+
+    public static boolean kubeJsScriptExists(Path gameDir) {
+        return Files.exists(resolveDefaultKubeJsScriptPath(gameDir));
+    }
+
+    /**
+     * Saves the generated KubeJS server script directly to
+     * {@code <gameDir>/kubejs/server_scripts/planomega_sandbox.js}.
+     * <p>
+     * If the target file already exists and {@code confirmOverwrite} is {@code false},
+     * no files are modified and {@link KubeJsSaveResult#requiresOverwriteConfirmation()} is {@code true}.
+     * When {@code confirmOverwrite} is {@code true} and the file exists, a {@code .bak} copy is
+     * written alongside it before overwriting.
+     */
+    public static KubeJsSaveResult saveKubeJsScript(
+            PlanGraph graph,
+            Path gameDir,
+            boolean confirmOverwrite
+    ) throws IOException {
+        return saveKubeJsScriptToFile(graph, resolveDefaultKubeJsScriptPath(gameDir), confirmOverwrite);
+    }
+
+    /**
+     * Saves the generated KubeJS server script directly to {@code targetPath}, creating a {@code .bak}
+     * backup if {@code targetPath} already exists and {@code confirmOverwrite} is {@code true}.
+     */
+    public static KubeJsSaveResult saveKubeJsScriptToFile(
+            PlanGraph graph,
+            Path targetPath,
+            boolean confirmOverwrite
+    ) throws IOException {
+        boolean exists = Files.exists(targetPath);
+        if (exists && !confirmOverwrite) {
+            return new KubeJsSaveResult(
+                    false,
+                    true,
+                    targetPath,
+                    null,
+                    KUBEJS_RELOAD_COMMAND,
+                    "Target script already exists; overwrite confirmation required."
+            );
+        }
+
+        Path parent = targetPath.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+
+        Path backupPath = null;
+        if (exists) {
+            backupPath = targetPath.resolveSibling(targetPath.getFileName().toString() + ".bak");
+            Files.copy(targetPath, backupPath, StandardCopyOption.REPLACE_EXISTING);
+        }
+
+        String script = toKubeJsScript(graph);
+        Files.writeString(targetPath, script, StandardCharsets.UTF_8);
+
+        return new KubeJsSaveResult(
+                true,
+                false,
+                targetPath,
+                backupPath,
+                KUBEJS_RELOAD_COMMAND,
+                backupPath != null
+                        ? "Saved KubeJS script (backup created). Run " + KUBEJS_RELOAD_COMMAND
+                        : "Saved KubeJS script. Run " + KUBEJS_RELOAD_COMMAND
+        );
     }
 
     public static List<VirtualRecipeNode> collectSandboxNodes(PlanGraph graph) {

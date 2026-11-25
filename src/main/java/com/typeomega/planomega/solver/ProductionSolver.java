@@ -6,8 +6,11 @@ import com.typeomega.planomega.model.PlanNode;
 import com.typeomega.planomega.model.ProcessNode;
 import com.typeomega.planomega.model.RecipeNode;
 import com.typeomega.planomega.model.ResourceKey;
+import com.typeomega.planomega.model.ResourceKind;
 import com.typeomega.planomega.model.ResourcePort;
+import com.typeomega.planomega.model.VoltageTier;
 import com.typeomega.planomega.solver.OverclockCalculator.OverclockSpec;
+import com.typeomega.planomega.solver.SolveResult.MachineBomEntry;
 import com.typeomega.planomega.solver.SolveResult.NodeSolveStats;
 import com.typeomega.planomega.solver.SolveResult.Status;
 import org.ojalgo.optimisation.Expression;
@@ -265,7 +268,8 @@ public final class ProductionSolver {
                     peakEut,
                     spec.effectiveTicks(),
                     spec.subtickParallels(),
-                    spec.machineTier()
+                    spec.machineTier(),
+                    spec.parallelCount()
             ));
         }
 
@@ -291,6 +295,8 @@ public final class ProductionSolver {
             }
         }
 
+        List<MachineBomEntry> machineBom = buildMachineBom(processNodes, nodeStats, specs);
+
         Status status = state.isOptimal() ? Status.OPTIMAL : Status.FEASIBLE;
         return new SolveResult(
                 status,
@@ -301,8 +307,161 @@ public final class ProductionSolver {
                 totalConsumedEu,
                 totalGeneratedEu,
                 totalMachinesCeil,
-                null
+                null,
+                machineBom
         );
+    }
+
+    private static List<MachineBomEntry> buildMachineBom(
+            List<ProcessNode> processNodes,
+            Map<String, NodeSolveStats> nodeStats,
+            Map<String, OverclockSpec> specs
+    ) {
+        record BomKey(String machineKey, int tier, String coilTier) {}
+        class BomAcc {
+            String displayName;
+            int machineCount;
+            boolean multiblock;
+            int inputBuses;
+            int outputBuses;
+            int inputHatches;
+            int outputHatches;
+            int energyHatches;
+            int estimatedCoils;
+            int parallelHatches;
+        }
+
+        Map<BomKey, BomAcc> grouped = new LinkedHashMap<>();
+        for (ProcessNode node : processNodes) {
+            NodeSolveStats stat = nodeStats.get(node.id());
+            if (stat == null || stat.machinesCeil() <= 0) {
+                continue;
+            }
+            OverclockSpec spec = specs.get(node.id());
+            String machineKey = (node.machineId() != null && !node.machineId().isBlank())
+                    ? node.machineId()
+                    : node.recipeTypeId();
+            int count = stat.machinesCeil();
+            int tier = stat.machineTier();
+            String coilTier = node.coilTier();
+            boolean multiblock = isMultiblockMachine(node, machineKey);
+
+            BomKey key = new BomKey(machineKey, tier, multiblock ? coilTier : null);
+            BomAcc acc = grouped.computeIfAbsent(key, k -> {
+                BomAcc a = new BomAcc();
+                a.displayName = formatMachineDisplayName(machineKey);
+                a.multiblock = multiblock;
+                return a;
+            });
+            acc.machineCount += count;
+
+            if (multiblock) {
+                int itemIns = (int) node.inputs().stream().filter(p -> p.resource().kind() == ResourceKind.ITEM).count();
+                int itemOuts = (int) node.outputs().stream().filter(p -> p.resource().kind() == ResourceKind.ITEM).count();
+                int fluidIns = (int) node.inputs().stream().filter(p -> p.resource().kind() == ResourceKind.FLUID).count();
+                int fluidOuts = (int) node.outputs().stream().filter(p -> p.resource().kind() == ResourceKind.FLUID).count();
+
+                if (itemIns > 0) {
+                    acc.inputBuses += count;
+                }
+                if (itemOuts > 0) {
+                    acc.outputBuses += count;
+                }
+                if (fluidIns > 0) {
+                    acc.inputHatches += count * Math.min(2, fluidIns);
+                }
+                if (fluidOuts > 0) {
+                    String lower = machineKey.toLowerCase(java.util.Locale.ROOT);
+                    int perMachineOutHatches = lower.contains("distillation_tower") ? fluidOuts : Math.min(2, fluidOuts);
+                    acc.outputHatches += count * perMachineOutHatches;
+                }
+                if (spec.effectiveEut() > 0) {
+                    long tierVoltage = VoltageTier.byIndex(tier).voltage();
+                    int hatchesPerMachine = spec.effectiveEut() > tierVoltage ? 2 : 1;
+                    acc.energyHatches += count * hatchesPerMachine;
+                }
+                int coilsPerMachine = estimateCoilsPerMachine(node, machineKey);
+                acc.estimatedCoils += count * coilsPerMachine;
+                if (spec.parallelCount() > 1) {
+                    acc.parallelHatches += count;
+                }
+            }
+        }
+
+        List<MachineBomEntry> result = new ArrayList<>(grouped.size());
+        for (Map.Entry<BomKey, BomAcc> e : grouped.entrySet()) {
+            BomKey k = e.getKey();
+            BomAcc a = e.getValue();
+            result.add(new MachineBomEntry(
+                    k.machineKey(),
+                    a.displayName,
+                    k.tier(),
+                    a.machineCount,
+                    a.multiblock,
+                    a.inputBuses,
+                    a.outputBuses,
+                    a.inputHatches,
+                    a.outputHatches,
+                    a.energyHatches,
+                    k.coilTier(),
+                    a.estimatedCoils,
+                    a.parallelHatches
+            ));
+        }
+        return result;
+    }
+
+    private static boolean isMultiblockMachine(ProcessNode node, String machineKey) {
+        if (node.coilTemp() > 0 || node.coilTier() != null || node.parallelCount() > 1) {
+            return true;
+        }
+        String lower = machineKey.toLowerCase(java.util.Locale.ROOT);
+        return lower.contains("electric_blast_furnace")
+                || lower.contains("ebf")
+                || lower.contains("pyrolyse")
+                || lower.contains("cracker")
+                || lower.contains("distillation_tower")
+                || lower.contains("vacuum_freezer")
+                || lower.contains("assembly_line")
+                || lower.contains("large_chemical_reactor")
+                || lower.contains("implosion_compressor")
+                || lower.contains("fusion_reactor")
+                || lower.contains("multi_smelter")
+                || lower.contains("large_")
+                || lower.contains("mega_");
+    }
+
+    private static int estimateCoilsPerMachine(ProcessNode node, String machineKey) {
+        String lower = machineKey.toLowerCase(java.util.Locale.ROOT);
+        if (lower.contains("multi_smelter")) {
+            return 8;
+        }
+        if (lower.contains("electric_blast_furnace") || lower.contains("ebf")
+                || lower.contains("pyrolyse") || lower.contains("cracker")
+                || node.coilTemp() > 0 || node.coilTier() != null) {
+            return 16;
+        }
+        return 0;
+    }
+
+    private static String formatMachineDisplayName(String machineKey) {
+        int colon = machineKey.indexOf(':');
+        String raw = colon >= 0 ? machineKey.substring(colon + 1) : machineKey;
+        String[] parts = raw.split("_");
+        StringBuilder sb = new StringBuilder();
+        for (String p : parts) {
+            if (p.isEmpty()) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append(' ');
+            }
+            sb.append(Character.toUpperCase(p.charAt(0)));
+            if (p.length() > 1) {
+                sb.append(p.substring(1));
+            }
+        }
+        return sb.length() == 0 ? machineKey : sb.toString();
     }
 
     private static String diagnoseInfeasibility(

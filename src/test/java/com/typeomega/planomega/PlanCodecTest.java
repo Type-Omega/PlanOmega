@@ -2,9 +2,13 @@ package com.typeomega.planomega;
 
 import com.typeomega.planomega.client.storage.PlanStorage;
 import com.typeomega.planomega.codec.DemoGraphFactory;
+import com.typeomega.planomega.codec.GroupTemplateCodec;
 import com.typeomega.planomega.codec.PlanCodec;
+import com.typeomega.planomega.model.GroupNode;
 import com.typeomega.planomega.model.PlanGraph;
 import com.typeomega.planomega.model.RecipeNode;
+import com.typeomega.planomega.model.ResourceKey;
+import com.typeomega.planomega.model.ResourcePort;
 import com.typeomega.planomega.model.StickyNoteNode;
 import com.typeomega.planomega.model.VirtualRecipeNode;
 import org.junit.jupiter.api.Test;
@@ -71,5 +75,71 @@ class PlanCodecTest {
         assertEquals(graph, loaded);
         assertTrue(PlanStorage.deletePlan(file));
         assertFalse(PlanStorage.deletePlan(file));
+    }
+
+    @Test
+    void schemaVersionBackwardCompatibilityAndV2CoilParallelRoundTrip() {
+        // Legacy v1 JSON without coilTier / parallelCount defaults safely
+        String v1Json = """
+                {
+                  "schemaVersion": 1,
+                  "name": "Legacy V1",
+                  "nodes": [
+                    {
+                      "type": "recipe",
+                      "id": "n1",
+                      "recipeId": "gtceu:electric_blast_furnace/steel",
+                      "recipeTypeId": "gtceu:electric_blast_furnace",
+                      "title": "Steel",
+                      "eut": 120,
+                      "durationTicks": 200,
+                      "tier": 2,
+                      "coilTemp": 1800,
+                      "inputs": [],
+                      "outputs": []
+                    }
+                  ],
+                  "edges": []
+                }
+                """;
+        PlanGraph v1 = PlanCodec.fromJson(v1Json);
+        assertEquals(1, v1.schemaVersion());
+        RecipeNode v1Node = (RecipeNode) v1.nodes().get("n1");
+        assertEquals(null, v1Node.coilTier());
+        assertEquals(1, v1Node.parallelCount());
+
+        // V2 round-trip preserves coilTier and parallelCount
+        RecipeNode upgraded = v1Node.withCoilAndParallel("kanthal", 16);
+        PlanGraph v2 = PlanGraph.empty("V2 Plan").withNode(upgraded);
+        String v2Json = PlanCodec.toJson(v2);
+        PlanGraph roundTrip = PlanCodec.fromJson(v2Json);
+        assertEquals(PlanCodec.CODEC_SCHEMA_VERSION, roundTrip.schemaVersion());
+        RecipeNode rtNode = (RecipeNode) roundTrip.nodes().get("n1");
+        assertEquals("kanthal", rtNode.coilTier());
+        assertEquals(16, rtNode.parallelCount());
+    }
+
+    @Test
+    void groupTemplateCodecAndStorageRoundTripAndInstantiate(@TempDir Path tempDir) throws IOException {
+        PlanGraph sample = DemoGraphFactory.createSampleSulfuricAcidPlan();
+        PlanGraph sub = sample.extractSubgraph(java.util.List.of("node_so2", "node_so3"));
+        GroupNode grp = new GroupNode("grp_acid", 0, 0, 400, 200, null, "Acid Core", 0, false, java.util.List.of("node_so2", "node_so3"));
+        PlanGraph templateGraph = sub.withNode(grp);
+
+        String json = GroupTemplateCodec.toJson("Acid Core Template", "SO2 -> SO3", templateGraph);
+        GroupTemplateCodec.GroupTemplate parsed = GroupTemplateCodec.fromJson(json);
+        assertEquals("Acid Core Template", parsed.name());
+        assertEquals("SO2 -> SO3", parsed.description());
+        assertEquals(3, parsed.subgraph().nodes().size());
+
+        PlanGraph instantiated = GroupTemplateCodec.instantiate(parsed, 500.0, 300.0);
+        assertEquals(3, instantiated.nodes().size());
+        assertFalse(instantiated.nodes().containsKey("grp_acid"));
+
+        Path saved = tempDir.resolve("acid_core" + GroupTemplateCodec.TEMPLATE_EXT);
+        Files.writeString(saved, json);
+        GroupTemplateCodec.GroupTemplate loaded = PlanStorage.loadGroupTemplate(saved);
+        assertEquals("Acid Core Template", loaded.name());
+        assertTrue(PlanStorage.deleteGroupTemplate(saved));
     }
 }

@@ -7,7 +7,9 @@ import com.typeomega.planomega.client.storage.PlanStorage;
 import com.typeomega.planomega.client.ui.CanvasGeometry.PortHit;
 import com.typeomega.planomega.client.ui.CanvasRenderer.MinimapBounds;
 import com.typeomega.planomega.client.ui.CanvasRenderer.RenderContext;
+import com.typeomega.planomega.codec.GroupTemplateCodec;
 import com.typeomega.planomega.integration.IntegrationBridge;
+import com.typeomega.planomega.integration.ae2.Ae2Bridge;
 import com.typeomega.planomega.model.GroupNode;
 import com.typeomega.planomega.model.PlanEdge;
 import com.typeomega.planomega.model.PlanGraph;
@@ -97,6 +99,8 @@ public final class PlannerScreen extends Screen {
     private @Nullable String toastText;
     private long toastExpiresAtMs = 0L;
     private boolean initialFitDone = false;
+    private @Nullable PlanGraph copiedSubgraph;
+    private int pasteSequence = 0;
 
     public PlannerScreen() {
         super(Component.translatable("planomega.title"));
@@ -166,10 +170,12 @@ public final class PlannerScreen extends Screen {
                     rebuildToolbarButtons();
                 }),
                 new ButtonSpec(Theme.ICON_FIT, "planomega.toolbar.fit", "F", Theme.BTN_BORDER, false, this::fitGraphToView),
-                new ButtonSpec(Theme.ICON_LAYOUT, "planomega.toolbar.layout", "L", Theme.ACCENT_TEAL, false, this::performAutoLayout)
+                new ButtonSpec(Theme.ICON_LAYOUT, "planomega.toolbar.layout", "L", Theme.ACCENT_TEAL, false, this::performAutoLayout),
+                new ButtonSpec(Theme.ICON_LAYOUT, "planomega.toolbar.auto_connect", "", Theme.ACCENT_TEAL, false, () -> performAutoConnect(false))
         );
 
         List<ButtonSpec> rightSpecs = List.of(
+                new ButtonSpec(Theme.ICON_GROUP, "planomega.toolbar.templates", "", Theme.ACCENT_TEAL, false, this::openTemplatesModal),
                 new ButtonSpec(Theme.ICON_EXPORT, "planomega.toolbar.export", "E", Theme.ACCENT_AMBER, false, this::openExportModal),
                 new ButtonSpec(Theme.ICON_SUMMARY, "planomega.toolbar.summary", "Tab", Theme.ACCENT_TEAL, summaryOpen, () -> {
                     summaryOpen = !summaryOpen;
@@ -445,6 +451,16 @@ public final class PlannerScreen extends Screen {
                         .withStyle(Style.EMPTY.withColor(0xFFC4B5FD)));
             }
 
+            if (Ae2Bridge.isAvailable()) {
+                long stored = Ae2Bridge.getStoredAmount(key);
+                boolean craftable = Ae2Bridge.hasAutocrafting(key);
+                if (stored > 0 || craftable) {
+                    String ae2Text = "AE2: " + stored + (craftable ? " [Autocraft]" : "");
+                    lines.add(Component.literal(ae2Text)
+                            .withStyle(Style.EMPTY.withColor(craftable ? Theme.ACCENT_TEAL : Theme.TEXT_SECONDARY)));
+                }
+            }
+
             gfx.renderComponentTooltip(this.font, lines, mouseX, mouseY);
         }
     }
@@ -691,7 +707,7 @@ public final class PlannerScreen extends Screen {
 
             if (Math.hypot(maxX - minX, maxY - minY) > 4.0) {
                 for (PlanNode node : graph.nodes().values()) {
-                    if (node instanceof GroupNode || graph.isHiddenByCollapsedGroup(node.id())) {
+                    if ((node instanceof GroupNode g && !g.collapsed()) || graph.isHiddenByCollapsedGroup(node.id())) {
                         continue;
                     }
                     if (CanvasGeometry.intersectsRect(node, minX, minY, maxX, maxY)) {
@@ -757,6 +773,14 @@ public final class PlannerScreen extends Screen {
         }
         if (ctrl && keyCode == GLFW.GLFW_KEY_G) {
             groupSelected();
+            return true;
+        }
+        if (ctrl && keyCode == GLFW.GLFW_KEY_C) {
+            copySelection();
+            return true;
+        }
+        if (ctrl && keyCode == GLFW.GLFW_KEY_V) {
+            pasteSelection();
             return true;
         }
         if (keyCode == GLFW.GLFW_KEY_DELETE || keyCode == GLFW.GLFW_KEY_BACKSPACE) {
@@ -857,26 +881,39 @@ public final class PlannerScreen extends Screen {
     private void insertAndWireRecipe(RecipeEntry entry, PlanNode anchor, PortHit anchorPort, boolean anchorIsInput) {
         double offsetX = anchorIsInput ? -270.0 : anchor.width() + 60.0;
         double wx = CanvasViewport.snap(anchor.x() + offsetX, snapToGrid);
-        double wy = CanvasViewport.snap(anchor.y(), snapToGrid);
+        double wy = CanvasViewport.snap(anchorPort.worldPos().y() - 48.0, snapToGrid);
         RecipeNode newNode = entry.toRecipeNode(wx, wy);
         PlanGraph next = graph.withNode(newNode);
 
         List<ResourcePort> candidates = anchorIsInput ? newNode.outputs() : newNode.inputs();
+        ResourceKey targetKey = anchorPort.port().resource();
+        ResourcePort matched = null;
         for (ResourcePort candidate : candidates) {
-            if (candidate.resource().isCompatibleWith(anchorPort.port().resource())) {
-                String fromNode = anchorIsInput ? newNode.id() : anchor.id();
-                String fromPort = anchorIsInput ? candidate.id() : anchorPort.port().id();
-                String toNode = anchorIsInput ? anchor.id() : newNode.id();
-                String toPort = anchorIsInput ? anchorPort.port().id() : candidate.id();
-                if (next.canConnect(fromNode, fromPort, toNode, toPort)) {
-                    next = next.withEdge(new PlanEdge(
-                            PlanGraph.newId("edge"),
-                            fromNode, fromPort, toNode, toPort,
-                            candidate.resource(),
-                            true
-                    ));
+            if (candidate.resource().equals(targetKey)) {
+                matched = candidate;
+                break;
+            }
+        }
+        if (matched == null) {
+            for (ResourcePort candidate : candidates) {
+                if (candidate.resource().isCompatibleWith(targetKey)) {
+                    matched = candidate;
                     break;
                 }
+            }
+        }
+        if (matched != null) {
+            String fromNode = anchorIsInput ? newNode.id() : anchor.id();
+            String fromPort = anchorIsInput ? matched.id() : anchorPort.port().id();
+            String toNode = anchorIsInput ? anchor.id() : newNode.id();
+            String toPort = anchorIsInput ? anchorPort.port().id() : matched.id();
+            if (next.canConnect(fromNode, fromPort, toNode, toPort)) {
+                next = next.withEdge(new PlanEdge(
+                        PlanGraph.newId("edge"),
+                        fromNode, fromPort, toNode, toPort,
+                        matched.resource(),
+                        true
+                ));
             }
         }
         commitMutation(next);
@@ -1096,11 +1133,130 @@ public final class PlannerScreen extends Screen {
         showToast(Component.translatable("planomega.toast.auto_layout").getString());
     }
 
+    private void performAutoConnect(boolean closeLoops) {
+        if (graph.nodes().isEmpty()) {
+            return;
+        }
+        PlanGraph.AutoConnectResult result = graph.autoConnect(closeLoops);
+        if (result.connectionsAdded() > 0) {
+            commitMutation(result.graph());
+            showToast(Component.translatable("planomega.toast.auto_connected", result.connectionsAdded()).getString());
+        } else {
+            showToast(Component.translatable("planomega.toast.auto_connect_none").getString());
+        }
+    }
+
+    private void copySelection() {
+        if (selectedNodeIds.isEmpty()) {
+            showToast(Component.translatable("planomega.toast.nothing_to_copy").getString());
+            return;
+        }
+        copiedSubgraph = graph.extractSubgraph(selectedNodeIds);
+        pasteSequence = 0;
+        showToast(Component.translatable("planomega.toast.copied_nodes", copiedSubgraph.nodes().size()).getString());
+    }
+
+    private void pasteSelection() {
+        if (copiedSubgraph == null || copiedSubgraph.nodes().isEmpty()) {
+            return;
+        }
+        pasteSequence++;
+        double offset = pasteSequence * 32.0;
+        PlanGraph cloned = GroupTemplateCodec.cloneWithFreshIds(copiedSubgraph, offset, offset);
+        commitMutation(graph.mergeSubgraph(cloned));
+        selectedNodeIds.clear();
+        selectedNodeIds.addAll(cloned.nodes().keySet());
+        selectedEdgeId = null;
+        showToast(Component.translatable("planomega.toast.pasted_nodes", cloned.nodes().size()).getString());
+    }
+
+    private void openTemplatesModal() {
+        double wx = CanvasViewport.snap(viewport.camX() - 100.0, snapToGrid);
+        double wy = CanvasViewport.snap(viewport.camY() - 60.0, snapToGrid);
+        openTemplatesModalAt(wx, wy);
+    }
+
+    private void openTemplatesModalAt(double wx, double wy) {
+        openModal(new PlannerModal.GroupTemplatesModal(
+                wx, wy,
+                instantiated -> {
+                    commitMutation(graph.mergeSubgraph(instantiated));
+                    selectedNodeIds.clear();
+                    selectedNodeIds.addAll(instantiated.nodes().keySet());
+                    selectedEdgeId = null;
+                },
+                this::showToast
+        ));
+    }
+
+    private boolean isPortConnected(PortHit portHit) {
+        boolean isInput = portHit.port().direction() == PortDirection.INPUT;
+        for (PlanEdge edge : graph.edges().values()) {
+            if (isInput
+                    && edge.toNodeId().equals(portHit.nodeId())
+                    && edge.toPortId().equals(portHit.port().id())) {
+                return true;
+            }
+            if (!isInput
+                    && edge.fromNodeId().equals(portHit.nodeId())
+                    && edge.fromPortId().equals(portHit.port().id())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void disconnectPort(PortHit portHit) {
+        boolean isInput = portHit.port().direction() == PortDirection.INPUT;
+        List<String> toRemove = new ArrayList<>();
+        for (PlanEdge edge : graph.edges().values()) {
+            if (isInput
+                    && edge.toNodeId().equals(portHit.nodeId())
+                    && edge.toPortId().equals(portHit.port().id())) {
+                toRemove.add(edge.id());
+            } else if (!isInput
+                    && edge.fromNodeId().equals(portHit.nodeId())
+                    && edge.fromPortId().equals(portHit.port().id())) {
+                toRemove.add(edge.id());
+            }
+        }
+        if (!toRemove.isEmpty()) {
+            commitMutation(graph.withoutEdges(toRemove));
+        }
+    }
+
     private void openContextMenuAt(int screenX, int screenY) {
         double wx = viewport.screenToWorldX(screenX);
         double wy = viewport.screenToWorldY(screenY);
 
         List<ContextMenuItem> items = new ArrayList<>();
+        PortHit portHit = CanvasGeometry.findPortAt(graph, wx, wy);
+        if (portHit != null) {
+            boolean connected = isPortConnected(portHit);
+            if (portHit.port().direction() == PortDirection.INPUT) {
+                items.add(new ContextMenuItem(
+                        Component.translatable("planomega.ctx.generate_producer").getString(),
+                        Theme.ACCENT_TEAL,
+                        () -> openRecipeSearchForPort(portHit)
+                ));
+            } else {
+                items.add(new ContextMenuItem(
+                        Component.translatable("planomega.ctx.generate_consumer").getString(),
+                        Theme.ACCENT_TEAL,
+                        () -> openRecipeSearchForPort(portHit)
+                ));
+            }
+            if (connected) {
+                items.add(new ContextMenuItem(
+                        Component.translatable("planomega.ctx.disconnect_port").getString(),
+                        0xFFEF4444,
+                        () -> disconnectPort(portHit)
+                ));
+            }
+            this.activeContextMenu = new ContextMenu(screenX, screenY, items, this.font, this.width, this.height);
+            return;
+        }
+
         PlanNode nodeHit = CanvasGeometry.findNodeAt(graph, wx, wy);
         if (nodeHit != null) {
             if (!selectedNodeIds.contains(nodeHit.id())) {
@@ -1159,6 +1315,15 @@ public final class PlannerScreen extends Screen {
                         Component.translatable("planomega.ctx.rename_group").getString(),
                         Theme.TEXT_PRIMARY,
                         () -> openEditorForNode(group)
+                ));
+                items.add(new ContextMenuItem(
+                        Component.translatable("planomega.ctx.save_template").getString(),
+                        Theme.ACCENT_AMBER,
+                        () -> openModal(new PlannerModal.SaveTemplateModal(
+                                group.title(),
+                                graph.extractSubgraph(List.of(group.id())),
+                                this::showToast
+                        ))
                 ));
                 items.add(new ContextMenuItem(
                         Component.translatable("planomega.ctx.ungroup").getString(),
@@ -1238,6 +1403,28 @@ public final class PlannerScreen extends Screen {
                         Component.translatable("planomega.ctx.add_sandbox").getString(),
                         Theme.ACCENT_AMBER,
                         () -> createVirtualNodeAt(placeX, placeY)
+                ));
+                items.add(new ContextMenuItem(
+                        Component.translatable("planomega.ctx.insert_template").getString(),
+                        Theme.ACCENT_TEAL,
+                        () -> openTemplatesModalAt(placeX, placeY)
+                ));
+                if (copiedSubgraph != null && !copiedSubgraph.nodes().isEmpty()) {
+                    items.add(new ContextMenuItem(
+                            Component.translatable("planomega.ctx.paste").getString(),
+                            Theme.TEXT_PRIMARY,
+                            this::pasteSelection
+                    ));
+                }
+                items.add(new ContextMenuItem(
+                        Component.translatable("planomega.ctx.auto_connect").getString(),
+                        Theme.ACCENT_TEAL,
+                        () -> performAutoConnect(false)
+                ));
+                items.add(new ContextMenuItem(
+                        Component.translatable("planomega.ctx.auto_connect_loops").getString(),
+                        Theme.ACCENT_AMBER,
+                        () -> performAutoConnect(true)
                 ));
                 items.add(new ContextMenuItem(
                         Component.translatable("planomega.ctx.auto_layout").getString(),

@@ -192,4 +192,47 @@ class ProductionSolverTest {
         assertEquals(500.0, res.edgeFlows().get("e_b"), 1e-3);
         assertEquals(100.0, res.edgeFlows().get("e_loop"), 1e-3);
     }
+
+    @Test
+    void coilTierAndParallelCountScaleOverclockAndMachineBom() {
+        // EBF recipe: 1800K base, 120 EU/t (MV), 200 ticks, upgraded to IV (tier 5, 3 OC steps)
+        // With Tritanium coil (10800K => excess 9000K => 10x 900K discounts, 5x 1800K perfect OCs -> all 3 OC steps become perfect!)
+        RecipeNode ebfBase = new RecipeNode(
+                "ebf", 0, 0, 0, 0, null,
+                "gtceu:electric_blast_furnace/titanium", "gtceu:electric_blast_furnace", null, "EBF Titanium",
+                List.of(ResourcePort.input("in", ResourceKey.item("gtceu:titanium_dust"), 1)),
+                List.of(ResourcePort.output("out", ResourceKey.item("gtceu:titanium_ingot"), 1)),
+                120, 200, 5, null, 1800, false, false, 1, 16.0, "out", null
+        );
+        OverclockCalculator.OverclockSpec noCoil = OverclockCalculator.compute(ebfBase);
+        RecipeNode ebfTritaniumParallel = ebfBase.withCoilAndParallel("tritanium", 16);
+        OverclockCalculator.OverclockSpec withCoilParallel = OverclockCalculator.compute(ebfTritaniumParallel);
+
+        assertTrue(withCoilParallel.craftsPerSecondPerMachine() > noCoil.craftsPerSecondPerMachine() * 16.0);
+        assertEquals(16, withCoilParallel.parallelCount());
+
+        // Pyrolyse coil speed & Cracker EU/t discount
+        RecipeNode pyroCupro = new RecipeNode(
+                "pyro", 0, 0, 0, 0, null, "gtceu:pyrolyse_oven/charcoal", "gtceu:pyrolyse_oven", null, "Pyrolyse",
+                List.of(), List.of(ResourcePort.output("o", ResourceKey.item("minecraft:charcoal"), 1)),
+                96, 160, 2, null, 0, false, false, 1, null, null, null
+        ).withCoilTier("cupronickel");
+        assertEquals(213, OverclockCalculator.compute(pyroCupro).effectiveTicks()); // 160 / 0.75 = 213.33 -> floor 213
+
+        RecipeNode crackerKanthal = new RecipeNode(
+                "crack", 0, 0, 0, 0, null, "gtceu:cracker/naphtha", "gtceu:cracker", null, "Cracker",
+                List.of(), List.of(ResourcePort.output("o", ResourceKey.fluid("gtceu:steam_cracked_naphtha"), 1000)),
+                120, 80, 2, null, 0, false, false, 1, null, null, null
+        ).withCoilTier("kanthal");
+        assertEquals(108L, OverclockCalculator.compute(crackerKanthal).effectiveEut()); // 120 * 0.9 = 108
+
+        SolveResult solved = ProductionSolver.solve(PlanGraph.empty("BOM Test").withNode(ebfTritaniumParallel));
+        assertTrue(solved.isSolved());
+        assertFalse(solved.machineBom().isEmpty());
+        SolveResult.MachineBomEntry bomEntry = solved.machineBom().get(0);
+        assertEquals("tritanium", bomEntry.coilTier());
+        assertEquals(16, solved.nodeStats().get("ebf").parallelCount());
+        assertTrue(bomEntry.estimatedCoils() > 0);
+        assertTrue(bomEntry.parallelHatches() > 0);
+    }
 }

@@ -2,17 +2,22 @@ package com.typeomega.planomega.model;
 
 import org.jetbrains.annotations.Nullable;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.BiPredicate;
 
 /**
  * Immutable, versioned production-planner graph containing recipe nodes, sandbox virtual nodes,
@@ -339,5 +344,239 @@ public record PlanGraph(
                 group.collapsed(),
                 group.childNodeIds()
         );
+    }
+
+    /**
+     * Extracts a self-contained subgraph containing {@code selectedIds} (plus any GroupNode descendants)
+     * and all internal edges whose endpoints both lie within the extracted set.
+     */
+    public PlanGraph extractSubgraph(Collection<String> selectedIds) {
+        if (selectedIds == null || selectedIds.isEmpty()) {
+            return PlanGraph.empty(name);
+        }
+        Set<String> keepSet = new HashSet<>();
+        for (String nid : selectedIds) {
+            if (nodes.containsKey(nid)) {
+                collectWithGroupDescendants(nid, keepSet);
+            }
+        }
+        if (keepSet.isEmpty()) {
+            return PlanGraph.empty(name);
+        }
+
+        Map<String, PlanNode> nextNodes = new LinkedHashMap<>();
+        for (Map.Entry<String, PlanNode> entry : nodes.entrySet()) {
+            if (!keepSet.contains(entry.getKey())) {
+                continue;
+            }
+            PlanNode node = entry.getValue();
+            if (node.groupId() != null && !keepSet.contains(node.groupId())) {
+                node = node.withGroupId(null);
+            }
+            if (node instanceof GroupNode group) {
+                List<String> filteredChildren = group.childNodeIds().stream()
+                        .filter(keepSet::contains)
+                        .toList();
+                node = group.withChildNodeIds(filteredChildren);
+            }
+            nextNodes.put(entry.getKey(), node);
+        }
+
+        Map<String, PlanEdge> nextEdges = new LinkedHashMap<>();
+        for (Map.Entry<String, PlanEdge> entry : edges.entrySet()) {
+            PlanEdge edge = entry.getValue();
+            if (keepSet.contains(edge.fromNodeId()) && keepSet.contains(edge.toNodeId())) {
+                nextEdges.put(entry.getKey(), edge);
+            }
+        }
+
+        return new PlanGraph(schemaVersion, newId("sub"), name, author, description, nextNodes, nextEdges);
+    }
+
+    /**
+     * Merges all nodes and edges from {@code subgraph} into this graph, skipping edges that duplicate
+     * an existing endpoint pair.
+     */
+    public PlanGraph mergeSubgraph(PlanGraph subgraph) {
+        if (subgraph == null || subgraph.nodes().isEmpty()) {
+            return this;
+        }
+        Map<String, PlanNode> nextNodes = new LinkedHashMap<>(nodes);
+        nextNodes.putAll(subgraph.nodes());
+        PlanGraph merged = new PlanGraph(schemaVersion, id, name, author, description, nextNodes, edges);
+        for (PlanEdge edge : subgraph.edges().values()) {
+            if (merged.nodes().containsKey(edge.fromNodeId()) && merged.nodes().containsKey(edge.toNodeId())) {
+                merged = merged.withEdge(edge);
+            }
+        }
+        return merged;
+    }
+
+    public record AutoConnectResult(PlanGraph graph, int connectionsAdded) {
+    }
+
+    public AutoConnectResult autoConnect(boolean closeLoops) {
+        return autoConnect(closeLoops, null);
+    }
+
+    /**
+     * Automatically connects disconnected OUTPUT -&gt; INPUT ports with matching {@link ResourceKey}
+     * (exact match first, then {@code #tag} match). When {@code closeLoops} is false, connections
+     * that would introduce a cycle are skipped; when true, recycled byproduct/catalyst loops are allowed.
+     */
+    public AutoConnectResult autoConnect(
+            boolean closeLoops,
+            @Nullable BiPredicate<ResourceKey, ResourceKey> customTagMatcher
+    ) {
+        Set<String> connectedInputs = new HashSet<>();
+        Set<String> connectedOutputs = new HashSet<>();
+        Map<String, Set<String>> adj = new HashMap<>();
+
+        for (PlanEdge edge : edges.values()) {
+            connectedOutputs.add(portKey(edge.fromNodeId(), edge.fromPortId()));
+            connectedInputs.add(portKey(edge.toNodeId(), edge.toPortId()));
+            adj.computeIfAbsent(edge.fromNodeId(), k -> new HashSet<>()).add(edge.toNodeId());
+        }
+
+        List<ProcessNode> processNodes = new ArrayList<>();
+        for (PlanNode node : nodes.values()) {
+            if (node instanceof ProcessNode proc) {
+                processNodes.add(proc);
+            }
+        }
+
+        PlanGraph working = this;
+        int added = 0;
+
+        for (int pass = 0; pass < 2; pass++) {
+            boolean exactOnly = (pass == 0);
+            for (ProcessNode toProc : processNodes) {
+                for (ResourcePort inPort : toProc.inputs()) {
+                    String inKey = portKey(toProc.id(), inPort.id());
+                    if (connectedInputs.contains(inKey)) {
+                        continue;
+                    }
+                    for (ProcessNode fromProc : processNodes) {
+                        if (fromProc.id().equals(toProc.id())) {
+                            continue;
+                        }
+                        boolean matched = false;
+                        for (ResourcePort outPort : fromProc.outputs()) {
+                            String outKey = portKey(fromProc.id(), outPort.id());
+                            if (connectedOutputs.contains(outKey)) {
+                                continue;
+                            }
+                            boolean compatible = exactOnly
+                                    ? outPort.resource().equals(inPort.resource())
+                                    : isTagCompatible(outPort.resource(), inPort.resource(), customTagMatcher);
+                            if (!compatible) {
+                                continue;
+                            }
+                            if (!working.canConnect(fromProc.id(), outPort.id(), toProc.id(), inPort.id())) {
+                                continue;
+                            }
+                            if (!closeLoops && isReachable(adj, toProc.id(), fromProc.id())) {
+                                continue;
+                            }
+                            PlanEdge edge = new PlanEdge(
+                                    newId("edge"),
+                                    fromProc.id(),
+                                    outPort.id(),
+                                    toProc.id(),
+                                    inPort.id(),
+                                    outPort.resource(),
+                                    false
+                            );
+                            working = working.withEdge(edge);
+                            connectedInputs.add(inKey);
+                            connectedOutputs.add(outKey);
+                            adj.computeIfAbsent(fromProc.id(), k -> new HashSet<>()).add(toProc.id());
+                            added++;
+                            matched = true;
+                            break;
+                        }
+                        if (matched) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        return new AutoConnectResult(working, added);
+    }
+
+    private static String portKey(String nodeId, String portId) {
+        return nodeId + "\0" + portId;
+    }
+
+    private static boolean isReachable(Map<String, Set<String>> adj, String start, String target) {
+        if (start.equals(target)) {
+            return true;
+        }
+        Set<String> visited = new HashSet<>();
+        Queue<String> queue = new ArrayDeque<>();
+        visited.add(start);
+        queue.add(start);
+        while (!queue.isEmpty()) {
+            String cur = queue.poll();
+            for (String next : adj.getOrDefault(cur, Set.of())) {
+                if (next.equals(target)) {
+                    return true;
+                }
+                if (visited.add(next)) {
+                    queue.add(next);
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean isTagCompatible(
+            ResourceKey out,
+            ResourceKey in,
+            @Nullable BiPredicate<ResourceKey, ResourceKey> customTagMatcher
+    ) {
+        if (out.equals(in)) {
+            return true;
+        }
+        if (out.kind() == ResourceKind.TAG && in.kind() == ResourceKind.TAG) {
+            return out.id().equals(in.id());
+        }
+        boolean oneTagOneItem = (out.kind() == ResourceKind.TAG && in.kind() == ResourceKind.ITEM)
+                || (out.kind() == ResourceKind.ITEM && in.kind() == ResourceKind.TAG);
+        if (!oneTagOneItem) {
+            return false;
+        }
+        if (customTagMatcher != null && customTagMatcher.test(out, in)) {
+            return true;
+        }
+        ResourceKey tagKey = out.kind() == ResourceKind.TAG ? out : in;
+        ResourceKey itemKey = out.kind() == ResourceKind.ITEM ? out : in;
+        return matchesTagHeuristic(tagKey.id(), itemKey.id());
+    }
+
+    private static boolean matchesTagHeuristic(String tagId, String itemId) {
+        String tagPath = stripNamespace(tagId).toLowerCase(Locale.ROOT);
+        String itemPath = stripNamespace(itemId).toLowerCase(Locale.ROOT);
+        if (tagPath.isEmpty() || itemPath.isEmpty()) {
+            return false;
+        }
+        String[] segments = tagPath.split("/");
+        for (String seg : segments) {
+            if (seg.isEmpty()) {
+                continue;
+            }
+            String singular = (seg.length() > 3 && seg.endsWith("s")) ? seg.substring(0, seg.length() - 1) : seg;
+            if (!itemPath.contains(seg) && !itemPath.contains(singular)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String stripNamespace(String id) {
+        int colon = id.indexOf(':');
+        return colon >= 0 ? id.substring(colon + 1) : id;
     }
 }

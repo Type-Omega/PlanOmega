@@ -2,6 +2,8 @@ package com.typeomega.planomega.client.storage;
 
 import com.typeomega.planomega.PlanOmega;
 import com.typeomega.planomega.codec.DemoGraphFactory;
+import com.typeomega.planomega.codec.GroupTemplateCodec;
+import com.typeomega.planomega.codec.GroupTemplateCodec.GroupTemplate;
 import com.typeomega.planomega.codec.PlanCodec;
 import com.typeomega.planomega.model.PlanGraph;
 import net.minecraftforge.fml.loading.FMLPaths;
@@ -33,6 +35,75 @@ public final class PlanStorage {
 
     public static Path plansDir() {
         return FMLPaths.GAMEDIR.get().resolve("planomega").resolve("plans");
+    }
+
+    public static Path templatesDir() {
+        return FMLPaths.CONFIGDIR.get().resolve("planomega").resolve("templates");
+    }
+
+    public static Path saveGroupTemplate(String templateName, String description, PlanGraph subgraph) throws IOException {
+        Objects.requireNonNull(subgraph, "subgraph");
+        Path dir = templatesDir().normalize();
+        Files.createDirectories(dir);
+        String slug = sanitizeFileName(templateName);
+        Path target = dir.resolve(slug + GroupTemplateCodec.TEMPLATE_EXT).normalize();
+        if (!target.startsWith(dir)) {
+            throw new IOException("Unsafe template path: " + target);
+        }
+        Files.writeString(target, GroupTemplateCodec.toJson(templateName, description, subgraph), StandardCharsets.UTF_8);
+        return target;
+    }
+
+    public static GroupTemplate loadGroupTemplate(Path file) throws IOException {
+        if (file == null) {
+            throw new IOException("Template file path must not be null");
+        }
+        String content = Files.readString(file, StandardCharsets.UTF_8);
+        try {
+            return GroupTemplateCodec.fromJson(content);
+        } catch (RuntimeException e) {
+            throw new IOException("Corrupted template file '" + file.getFileName() + "': " + e.getMessage(), e);
+        }
+    }
+
+    public static List<SavedTemplateEntry> listGroupTemplates() {
+        Path dir = templatesDir();
+        if (!Files.isDirectory(dir)) {
+            return List.of();
+        }
+        List<SavedTemplateEntry> entries = new ArrayList<>();
+        try (Stream<Path> stream = Files.list(dir)) {
+            stream.filter(Files::isRegularFile)
+                    .filter(p -> p.getFileName().toString().endsWith(GroupTemplateCodec.TEMPLATE_EXT))
+                    .forEach(path -> {
+                        try {
+                            long modified = Files.getLastModifiedTime(path).toMillis();
+                            String fileName = path.getFileName().toString();
+                            String slug = fileName.substring(0, fileName.length() - GroupTemplateCodec.TEMPLATE_EXT.length());
+                            String displayName = slug;
+                            int nodeCount = 0;
+                            try {
+                                GroupTemplate tpl = loadGroupTemplate(path);
+                                displayName = tpl.name();
+                                nodeCount = tpl.subgraph().nodes().size();
+                            } catch (IOException ignored) {
+                            }
+                            entries.add(new SavedTemplateEntry(path, displayName, nodeCount, modified));
+                        } catch (IOException ignored) {
+                        }
+                    });
+        } catch (IOException e) {
+            PlanOmega.LOGGER.warn("Failed to enumerate saved group templates", e);
+        }
+        entries.sort(Comparator.comparingLong(SavedTemplateEntry::lastModifiedMillis).reversed());
+        return entries;
+    }
+
+    public static boolean deleteGroupTemplate(Path path) throws IOException {
+        if (path == null) {
+            return false;
+        }
+        return Files.deleteIfExists(path);
     }
 
     public static Path savePlan(PlanGraph graph) throws IOException {
@@ -136,5 +207,8 @@ public final class PlanStorage {
     }
 
     public record SavedPlanEntry(Path path, String name, long lastModifiedMillis) {
+    }
+
+    public record SavedTemplateEntry(Path path, String name, int nodeCount, long lastModifiedMillis) {
     }
 }
